@@ -500,7 +500,16 @@ STATE = {
 STATE_ORDER = {"wait": 0, "busy": 1, "free": 2}
 SORTS = ("state", "path")
 KEY = "bold #ceaadf"
-KEYS = Text.assemble(("enter", KEY), " jump   ", ("esc", KEY), " quit   ", ("^s", KEY), " sort")
+KEYS = Text.assemble(("⇧1-0", KEY), "/", ("enter", KEY), " jump   ",
+                     ("esc", KEY), " quit   ", ("^s", KEY), " sort")
+
+# shift+<digit> jumps to a numbered row. It arrives as the shifted *character*, never as
+# a key named "shift+1": tmux runs with extended-keys off, so the kitty keyboard protocol
+# Textual enables never reaches kitty; and even when it does reach it, Textual's CSI-u
+# parser drops the shift token whenever the key carries non-space text, so shift+1 is
+# "exclamation_mark" with character "!". US layout, which is what the digits above match.
+PICK = {c: n for n, c in enumerate("!@#$%^&*()")}
+NUMBERS = "1234567890"
 
 
 def fuzzy(needle, hay):
@@ -580,6 +589,7 @@ class CCJump(App):
         self.register_theme(PURPLE)
         self.theme = "ccjump"
         table = self.query_one(Table)
+        table.add_column("", width=1)          # the shift+<digit> that jumps to the row
         table.add_column("state", width=6)
         table.add_column("for", width=5)
         table.add_column("path", width=26)
@@ -624,9 +634,10 @@ class CCJump(App):
         under = self.rows[table.cursor_row].pid if 0 <= table.cursor_row < len(self.rows) else None
         self.rows = self.visible()
         table.clear()
-        for inst in self.rows:
+        for n, inst in enumerate(self.rows):
             mark, style = STATE[inst.state]
             table.add_row(
+                Text(NUMBERS[n] if n < len(NUMBERS) else " ", style="#626262"),
                 Text(mark, style=style),
                 Text(inst.age, style="#626262"),
                 self.mark(inst.short_path, "#b8a0be"),
@@ -648,8 +659,12 @@ class CCJump(App):
             ((f", {waiting} waiting", "bold #ffd700") if waiting else ("", "")),
             (f"  ·  by {self.sort}", "#b8a0be")))
 
-    # any printable key filters; nothing else in the app consumes plain characters
+    # a shifted digit picks its row; any other printable key filters
     def on_key(self, event):
+        if (n := PICK.get(event.character)) is not None:
+            event.stop()
+            self.jump_row(n)
+            return
         if event.key == "backspace":
             self.filter = self.filter[:-1]
         elif event.character and event.character.isprintable():
@@ -697,12 +712,16 @@ class CCJump(App):
         self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
         self.draw()
 
+    def jump_row(self, row):
+        """Focus that instance and stay open. Only escape quits."""
+        if not 0 <= row < len(self.rows):
+            return
+        self.query_one(Table).move_cursor(row=row)   # so the cursor shows what was taken
+        if err := jump(self.rows[row]):              # silent on success, toast on failure
+            self.notify(err, severity="warning", timeout=2)
+
     def action_jump(self):
-        """Focus the picked instance and stay open. Only escape quits."""
-        row = self.query_one(Table).cursor_row
-        if 0 <= row < len(self.rows):
-            if err := jump(self.rows[row]):        # silent on success, toast on failure
-                self.notify(err, severity="warning", timeout=2)
+        self.jump_row(self.query_one(Table).cursor_row)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         self.action_jump()
