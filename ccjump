@@ -273,6 +273,41 @@ def tmux_window_name(name):
         restore()
 
 
+@contextlib.contextmanager
+def kitty_window_title(name):
+    """Name our own kitty window (what the tab bar shows) for as long as the app runs.
+
+    tmux ships with `set-titles off`, so nothing inside a pane ever writes a title and
+    kitty falls back to its own default, the foreground process, which reads `uv` for the
+    same reason the tmux tab does. Setting it without `temporary` makes it permanent, so
+    it also survives a config with `set-titles on`; sending the command with no title at
+    all is what puts kitty's default back.
+
+    Target the window by the pid of the tmux client attached to our session, the same
+    `pid:N` match jump() uses. KITTY_WINDOW_ID cannot be trusted here: inside a pane it is
+    inherited from the environment the tmux *server* started in, so it can name a window
+    that closed long ago.
+    """
+    target = {}
+    if os.environ.get("TMUX"):
+        pid = sh("tmux", "display-message", "-p", "#{client_pid}").strip()
+        if not pid:                          # no client attached, so no window to name
+            yield
+            return
+        target = {"match": f"pid:{pid}"}
+    send_kitty("set-window-title", target | {"title": name})
+
+    def restore():
+        send_kitty("set-window-title", target)     # no title: back to kitty's default
+
+    ON_EXIT.append(restore)
+    try:
+        yield
+    finally:
+        ON_EXIT.remove(restore)
+        restore()
+
+
 # ----------------------------------------------------------------------------- ui
 
 from textual.app import App, ComposeResult          # noqa: E402
@@ -518,7 +553,7 @@ class CCJump(App):
 # ---------------------------------------------------------------------------- cli
 
 def cmd_ui():
-    with tmux_window_name("ccjump"):
+    with tmux_window_name("ccjump"), kitty_window_title("ccjump"):
         CCJump().run()
 
 
