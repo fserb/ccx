@@ -45,7 +45,7 @@ class Instance:
     tab: str = ""            # window index, only when the session holds >1 claude
     path: str = ""
     summary: str = ""
-    state: str = "idle"
+    state: str = "wait"
     last_write: float = 0    # epoch claude last wrote to its session log
     since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
@@ -92,8 +92,8 @@ def last_write(path):
 class StateClock:
     """When each instance entered its current state.
 
-    Seeded from the session log on first sight, which is accurate for an instance that is
-    sitting idle or waiting. Transitions seen while the app runs are timed directly.
+    Seeded from the session log on first sight, which is accurate for an instance that
+    is not busy. Transitions seen while the app runs are timed directly.
     """
 
     def __init__(self):
@@ -132,12 +132,34 @@ def capture(pane, lines=40):
     return sh("tmux", "capture-pane", "-p", "-t", pane, "-S", f"-{lines}")
 
 
+SPINNER = re.compile(r"…\s*\(\d+[hms]")   # "✽ Working… (16m 29s · ↓ 54.6k tokens)"
+BANNER = re.compile(r"Claude Code v\d")   # the startup banner, which /clear repaints
+
+
 def pane_state(text):
-    if re.search(r"Do you want|Would you like|❯ 1\.", text):
-        return "waiting"
-    if "esc to interrupt" in text:
+    """busy (a turn is running), free (nothing in the session), or wait (yours).
+
+    Read the bottom of the screen, never the whole capture: a marker matched anywhere in
+    the scrollback misreads a session that merely *discusses* it, and the pane talking
+    about these very patterns did exactly that. `esc to interrupt` also looks like the
+    busy marker and is not, since the bottom hint line still reads that way in a pane
+    that has been sitting untouched for minutes. The spinner is only drawn while a turn
+    actually runs, and it sits just above the prompt box.
+
+    A session with no conversation shows the startup banner with nothing under it, and
+    /clear repaints that banner, so walking up from the bottom and reaching the banner
+    before any assistant marker means the session is empty. Everything else wants you,
+    whether it holds a permission prompt or just finished its task.
+    """
+    lines = [l for l in text.splitlines() if l.strip()]
+    if any(SPINNER.search(l) for l in lines[-8:]):
         return "busy"
-    return "idle"
+    for line in reversed(lines):
+        if "⏺" in line:
+            break
+        if BANNER.search(line):
+            return "free"
+    return "wait"
 
 
 def discover():
@@ -161,7 +183,7 @@ def discover():
                 break
             cur = procs[cur][0]
         if not pane:
-            found.append(Instance(pid=pid, summary=cmd, state="idle"))
+            found.append(Instance(pid=pid, summary=cmd, state="wait"))
             continue
         client = client_by_session.get(pane["session_name"], {})
         found.append(Instance(
@@ -334,12 +356,14 @@ PURPLE = Theme(
     dark=True,
 )
 
+# #ffd700 is xterm 220, the exact color Claude Code paints "⏵⏵ auto mode on" with
+# (read off a live pane as `ESC[38;5;220m`), so the two agree on what wants you
 STATE = {
-    "waiting": ("● wait", "bold #ceaadf"),
+    "wait": ("● wait", "#ffd700"),
+    "free": ("◌ free", "#626262"),
     "busy": ("◐ busy", "#80c9be"),
-    "idle": ("○ idle", "#626262"),
 }
-STATE_ORDER = {"idle": 0, "waiting": 1, "busy": 2}
+STATE_ORDER = {"wait": 0, "free": 1, "busy": 2}
 SORTS = ("state", "path")
 KEY = "bold #ceaadf"
 KEYS = Text.assemble(("enter", KEY), " jump   ", ("esc", KEY), " quit   ", ("^s", KEY), " sort")
@@ -413,7 +437,10 @@ class CCJump(App):
             yield Static(id="status")
             yield Static(KEYS, id="keys")
         yield Rule(line_style="solid")
-        yield Table(cursor_type="row", zebra_stripes=False)
+        # cursor_foreground_priority: the cursor row keeps a cell's own color instead of
+        # flattening it to $block-cursor-foreground, so wait stays yellow when selected
+        yield Table(cursor_type="row", zebra_stripes=False,
+                    cursor_foreground_priority="renderable")
 
     def on_mount(self):
         self.register_theme(PURPLE)
@@ -431,7 +458,7 @@ class CCJump(App):
         self.draw()
 
     def visible(self):
-        # idle first, and within a state the one stuck there longest on top
+        # the ones that want you first, and within a state the one stuck there longest
         key = ((lambda i: (STATE_ORDER[i.state], i.since)) if self.sort == "state"
                else (lambda i: (i.short_path, i.pid)))
         if not self.filter:
@@ -467,13 +494,13 @@ class CCJump(App):
                 Text(mark, style=style),
                 Text(inst.age, style="#626262"),
                 self.mark(inst.short_path, "#b8a0be"),
-                self.mark(inst.summary, "#eeeeee" if inst.state == "waiting" else "#9a9aa0"),
+                self.mark(inst.summary, "#eeeeee" if inst.state == "wait" else "#9a9aa0"),
             )
         if self.rows:
             keep = next((n for n, i in enumerate(self.rows) if i.pid == under), None)
             table.move_cursor(row=keep if keep is not None else 0)
 
-        waiting = sum(i.state == "waiting" for i in self.instances)
+        waiting = sum(i.state == "wait" for i in self.instances)
         self.title = f"claude code · {len(self.instances)} running"
         self.query_one("#search", Static).update(
             Text(f"/{self.filter}", style="#ceaadf") if self.filter
@@ -482,7 +509,7 @@ class CCJump(App):
                  else f"{len(self.instances)} running")
         self.query_one("#status", Static).update(Text.assemble(
             (count, "#b8a0be"),
-            ((f", {waiting} waiting", "bold #ceaadf") if waiting else ("", "")),
+            ((f", {waiting} waiting", "bold #ffd700") if waiting else ("", "")),
             (f"  ·  by {self.sort}", "#b8a0be")))
 
     # any printable key filters; nothing else in the app consumes plain characters
