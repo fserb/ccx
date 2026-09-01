@@ -45,7 +45,7 @@ class Instance:
     tab: str = ""            # window index, only when the session holds >1 claude
     path: str = ""
     summary: str = ""
-    state: str = "wait"
+    state: str = ""          # "" until StateClock fills it in
     last_write: float = 0    # epoch claude last wrote to its session log
     since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
@@ -118,17 +118,21 @@ class StateClock:
 
     def __init__(self):
         self.seen = {}
-        self.woke = []       # instances that entered `wait` during the last update
+        self.woke = []       # instances that went busy -> wait during the last update
 
     def update(self, instances):
         now = time.time()
         self.woke = []
         for i in instances:
             state, since = self.seen.get(i.pid, (None, None))
+            # a screen we could not read is not a transition: an empty capture-pane, or a
+            # tmux hiccup that drops every pane, would otherwise read as wait and ring for
+            # every running instance at once
+            i.state = i.state or state or "wait"
             i.since = (i.last_write or now) if state is None else (since if state == i.state else now)
-            # first sight is not a transition, so starting up is silent no matter how
-            # many instances are already waiting
-            if state is not None and state != i.state == "wait":
+            # only busy -> wait rings, which is a turn ending or a prompt appearing. first
+            # sight is not a transition, so starting up is silent however many are waiting
+            if state == "busy" and i.state == "wait":
                 self.woke.append(i)
             self.seen[i.pid] = (i.state, i.since)
         live = {i.pid for i in instances}
@@ -158,7 +162,12 @@ def capture(pane, lines=40):
     return sh("tmux", "capture-pane", "-p", "-t", pane, "-S", f"-{lines}")
 
 
-SPINNER = re.compile(r"…\s*\(\d+[hms]")   # "✽ Working… (16m 29s · ↓ 54.6k tokens)"
+# the spinner line, "✽ Working… (16m 29s · ↓ 54.6k tokens)". The parenthetical is drawn
+# a moment after the label, so ~3% of captures during a turn (measured) catch a bare
+# "✽ Beboppin'…" and requiring it read those frames as wait. Anchor on the cycling glyph
+# instead, which also keeps "⏺ Calling chrome-devtools 5 times…" (tool output, not the
+# spinner) out.
+SPINNER = re.compile(r"^\s*[·✢✳✶✻✽*]\s+\S.*…")
 BANNER = re.compile(r"Claude Code v\d")   # the startup banner, which /clear repaints
 
 
@@ -178,6 +187,8 @@ def pane_state(text):
     whether it holds a permission prompt or just finished its task.
     """
     lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return ""            # nothing was read; the caller keeps the previous state
     if any(SPINNER.search(l) for l in lines[-8:]):
         return "busy"
     for line in reversed(lines):
@@ -209,7 +220,7 @@ def discover():
                 break
             cur = procs[cur][0]
         if not pane:
-            found.append(Instance(pid=pid, summary=cmd, state="wait"))
+            found.append(Instance(pid=pid, summary=cmd))   # no pane, so no state
             continue
         client = client_by_session.get(pane["session_name"], {})
         found.append(Instance(
@@ -623,7 +634,7 @@ def cmd_doctor():
     print(f"tmux allow-passthrough: {sh('tmux', 'show', '-gv', 'allow-passthrough').strip()}")
     for i in discover():
         print(f"  pid {i.pid} pane {i.pane or '-'} session {i.session or '-'} "
-              f"state {i.state} match {i.match or '(unresolved)'}")
+              f"state {i.state or '?'} match {i.match or '(unresolved)'}")
 
 
 def cmd_focus(pid=None):
