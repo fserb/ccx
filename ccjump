@@ -335,7 +335,7 @@ PURPLE = Theme(
 )
 
 STATE = {
-    "waiting": ("● waiting", "bold #ceaadf"),
+    "waiting": ("● wait", "bold #ceaadf"),
     "busy": ("◐ busy", "#80c9be"),
     "idle": ("○ idle", "#626262"),
 }
@@ -419,7 +419,7 @@ class CCJump(App):
         self.register_theme(PURPLE)
         self.theme = "ccjump"
         table = self.query_one(Table)
-        table.add_column("state", width=10)
+        table.add_column("state", width=6)
         table.add_column("for", width=5)
         table.add_column("path", width=26)
         table.add_column("summary")
@@ -559,7 +559,7 @@ def cmd_ui():
 
 def cmd_list():
     for i in StateClock().update(discover()):
-        print(f"{STATE[i.state][0]:<10} {i.age:>4}  {i.short_path:<30} {i.summary}")
+        print(f"{STATE[i.state][0]:<6} {i.age:>4}  {i.short_path:<30} {i.summary}")
 
 
 def cmd_doctor():
