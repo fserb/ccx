@@ -598,13 +598,20 @@ class CCJump(App):
             play()
         self.draw()
 
+    @property
+    def needle(self):
+        """What is actually matched: the filter with its ends trimmed. A leading space
+        is how you search for something starting with a digit, since a digit typed into
+        an *empty* filter picks a row instead; " 3" then matches the same as "3"."""
+        return self.filter.strip().lower()
+
     def visible(self):
         # the ones that want you first, and within a state the one stuck there longest
         key = ((lambda i: (STATE_ORDER[i.state], i.since)) if self.sort == "state"
                else (lambda i: (i.short_path, i.pid)))
-        if not self.filter:
+        needle = self.needle
+        if not needle:
             return sorted(self.instances, key=key)
-        needle = self.filter.lower()
         scored = []
         for i in self.instances:
             hits = [h for h in (fuzzy(needle, i.short_path), fuzzy(needle, i.summary)) if h]
@@ -617,7 +624,7 @@ class CCJump(App):
     def mark(self, text, style):
         """Paint the matched characters, so a loose match shows what it matched on."""
         out = Text(text, style=style)
-        hit = fuzzy(self.filter.lower(), text) if self.filter else None
+        hit = fuzzy(self.needle, text) if self.needle else None
         for i in hit[1] if hit else ():
             out.stylize(KEY, i, i + 1)
         return out
