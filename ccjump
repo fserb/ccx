@@ -46,6 +46,7 @@ class Instance:
     path: str = ""
     summary: str = ""
     state: str = ""          # "" until StateClock fills it in
+    status_since: float = 0  # epoch of the record's last status change, 0 without one
     last_write: float = 0    # epoch claude last wrote to its session log
     since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
@@ -74,6 +75,14 @@ def fmt_age(seconds):
     return f"{seconds // 3600}h"
 
 
+SESSIONS = f"{HOME}/.claude/sessions"
+
+
+def project_dir(cwd):
+    """Where claude keeps the session logs for a cwd: the path, non-alphanumerics to -."""
+    return f"{HOME}/.claude/projects/{re.sub(r'[^A-Za-z0-9]', '-', cwd)}"
+
+
 def last_write(path):
     """When claude last wrote a message for this cwd, from its session log's mtime.
 
@@ -81,12 +90,80 @@ def last_write(path):
     repaints constantly, so an idle pane still reports activity ~now. The session log is
     only appended on real messages.
     """
-    slug = re.sub(r"[^A-Za-z0-9]", "-", path)
     try:
-        entries = os.scandir(f"{HOME}/.claude/projects/{slug}")
+        entries = os.scandir(project_dir(path))
         return max(e.stat().st_mtime for e in entries if e.name.endswith(".jsonl"))
     except (OSError, ValueError):
         return 0
+
+
+# what Claude Code calls itself, in ~/.claude/sessions/<pid>.json, mapped onto our three.
+# "waiting" is a dialog holding the screen (a permission prompt, /model, an elicitation)
+# and "shell" is idle with a background shell still running; both want you, like "idle"
+RECORD_STATE = {"busy": "busy", "waiting": "wait", "idle": "wait", "shell": "wait"}
+BIG_LOG = 256 * 1024
+
+
+def session_records():
+    """Claude Code's own view of every live session, keyed by pid.
+
+    It writes ~/.claude/sessions/<pid>.json for each interactive session and rewrites it
+    on every status change, so `status` is the state as the process itself knows it, not
+    as the screen looks: "busy" is a turn in flight *including the final message
+    streaming out*, which is the one the screen cannot see. Reading it is what keeps a
+    session that is still writing its answer from being called wait (verified live: the
+    scrape called two sessions wait while they were retrying an API error, and the
+    records said busy). Checked against Claude Code v2.1.252; a version that stops
+    writing these files falls back to pane_state().
+    """
+    try:
+        entries = os.scandir(SESSIONS)
+    except OSError:
+        return {}
+    records = {}
+    for e in entries:
+        pid, _, ext = e.name.partition(".")
+        if ext != "json" or not pid.isdigit():
+            continue
+        try:
+            with open(e.path) as f:
+                records[int(pid)] = json.load(f)
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+def record_state(rec):
+    """(state, epoch it started), or ("", 0) when this pid has no record.
+
+    A session with nothing in it is free, except when a dialog is up: that one is asking
+    you something, empty or not, which is what an unanswered trust prompt is.
+    """
+    state = RECORD_STATE.get(rec.get("status"), "")
+    if not state:
+        return "", 0
+    if (state == "wait" and rec.get("status") != "waiting"
+            and not has_reply(rec.get("cwd", ""), rec.get("sessionId", ""))):
+        state = "free"
+    return state, (rec.get("statusUpdatedAt") or 0) / 1000
+
+
+def has_reply(cwd, session_id):
+    """Whether this session ever got an answer, which is what free is not.
+
+    /clear starts a *new* sessionId, and a fresh one's log holds a handful of bookkeeping
+    lines (~2.6KB) with no assistant entry, so this reads the same as a session that has
+    never been asked anything. Any log past BIG_LOG is a real conversation, which keeps
+    the read small; the log for a session that has said nothing yet does not exist.
+    """
+    path = f"{project_dir(cwd)}/{session_id}.jsonl"
+    try:
+        if os.path.getsize(path) > BIG_LOG:
+            return True
+        with open(path, "rb") as f:
+            return b'"type":"assistant"' in f.read()
+    except OSError:
+        return False
 
 
 SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
@@ -112,8 +189,10 @@ def play(sound=SOUND):
 class StateClock:
     """When each instance entered its current state, and which ones just changed.
 
-    Seeded from the session log on first sight, which is accurate for an instance that
-    is not busy. Transitions seen while the app runs are timed directly.
+    The record's statusUpdatedAt is the transition itself, so it beats both the poll it
+    was noticed in and the session-log mtime, which is only the seed left for instances
+    with no record. A displayed state that spans two of Claude's own (idle and shell are
+    both wait) keeps the earlier time, since the row did not change.
     """
 
     def __init__(self):
@@ -129,7 +208,12 @@ class StateClock:
             # tmux hiccup that drops every pane, would otherwise read as wait and ring for
             # every running instance at once
             i.state = i.state or state or "wait"
-            i.since = (i.last_write or now) if state is None else (since if state == i.state else now)
+            if state is None:                       # first sight
+                i.since = i.status_since or i.last_write or now
+            elif state == i.state:
+                i.since = since
+            else:
+                i.since = i.status_since or now
             # only busy -> wait rings, which is a turn ending or a prompt appearing. first
             # sight is not a transition, so starting up is silent however many are waiting
             if state == "busy" and i.state == "wait":
@@ -208,6 +292,7 @@ def summary_of(title):
 
 def discover():
     procs = processes()
+    records = session_records()
     panes = tmux_rows("list-panes", ["session_name", "window_index", "pane_index", "pane_id",
                                      "pane_pid", "pane_current_path", "pane_title"], "-a")
     clients = tmux_rows("list-clients", ["client_tty", "client_pid", "client_session"])
@@ -218,6 +303,8 @@ def discover():
     for pid, (_, cmd) in procs.items():
         if not IS_CLAUDE.search(cmd):
             continue
+        rec = records.get(pid, {})
+        state, since = record_state(rec)
         pane, cur = None, pid
         for _ in range(12):                      # walk up to the owning pane
             if cur in pane_by_pid:
@@ -227,7 +314,9 @@ def discover():
                 break
             cur = procs[cur][0]
         if not pane:
-            found.append(Instance(pid=pid, summary=cmd))   # no pane, so no state
+            # nothing to focus without a pane, but the record still knows the rest
+            found.append(Instance(pid=pid, summary=cmd, path=rec.get("cwd", ""),
+                                  state=state, status_since=since))
             continue
         client = client_by_session.get(pane["session_name"], {})
         found.append(Instance(
@@ -238,8 +327,9 @@ def discover():
             pane_index=pane["pane_index"],
             path=pane["pane_current_path"],
             summary=summary_of(pane["pane_title"]),
-            state=pane_state(capture(pane["pane_id"])),
-            last_write=last_write(pane["pane_current_path"]),
+            state=state or pane_state(capture(pane["pane_id"])),
+            status_since=since,
+            last_write=0 if state else last_write(pane["pane_current_path"]),
             client_tty=client.get("client_tty", ""),
             client_pid=client.get("client_pid", ""),
         ))
@@ -639,9 +729,13 @@ def cmd_doctor():
     print(f"TMUX={os.environ.get('TMUX', '(none)')}  "
           f"KITTY_WINDOW_ID={os.environ.get('KITTY_WINDOW_ID', '(none)')}")
     print(f"tmux allow-passthrough: {sh('tmux', 'show', '-gv', 'allow-passthrough').strip()}")
+    records = session_records()
     for i in discover():
+        rec = records.get(i.pid, {})
         print(f"  pid {i.pid} pane {i.pane or '-'} session {i.session or '-'} "
-              f"state {i.state or '?'} match {i.match or '(unresolved)'}")
+              f"state {i.state or '?'} record {rec.get('status', '(none)')}"
+              f"{'/' + rec['waitingFor'] if rec.get('waitingFor') else ''} "
+              f"match {i.match or '(unresolved)'}")
 
 
 def cmd_focus(pid=None):
