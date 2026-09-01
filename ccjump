@@ -199,6 +199,13 @@ def pane_state(text):
     return "wait"
 
 
+def summary_of(title):
+    """Claude's own task summary, from pane_title. "Claude Code" is the default title
+    a session carries before it has one (and again after /clear), not a summary."""
+    text = title.lstrip("✳✶✻✽* ·").strip()
+    return "" if text == "Claude Code" else text
+
+
 def discover():
     procs = processes()
     panes = tmux_rows("list-panes", ["session_name", "window_index", "pane_index", "pane_id",
@@ -230,7 +237,7 @@ def discover():
             window=pane["window_index"],
             pane_index=pane["pane_index"],
             path=pane["pane_current_path"],
-            summary=pane["pane_title"].lstrip("✳✶✻✽* ·") or "claude",
+            summary=summary_of(pane["pane_title"]),
             state=pane_state(capture(pane["pane_id"])),
             last_write=last_write(pane["pane_current_path"]),
             client_tty=client.get("client_tty", ""),
