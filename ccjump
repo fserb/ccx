@@ -89,8 +89,28 @@ def last_write(path):
         return 0
 
 
+SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
+PLAYING = []
+
+
+def play(sound=SOUND):
+    """Play a sound and return immediately.
+
+    afplay runs for the length of the file (1.6s for Bottle.aiff) and reload() calls this
+    on the UI thread every 1.5s, so it cannot be waited on. An unwaited child stays a
+    zombie until the process dies, hence the poll of the earlier ones; SIGCHLD cannot be
+    ignored instead, because sh() uses subprocess.run and needs its own children to be
+    reapable. Missing afplay (not macOS) raises OSError and is simply no sound.
+    """
+    PLAYING[:] = [p for p in PLAYING if p.poll() is None]
+    with contextlib.suppress(OSError):
+        PLAYING.append(subprocess.Popen(["afplay", sound],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL))
+
+
 class StateClock:
-    """When each instance entered its current state.
+    """When each instance entered its current state, and which ones just changed.
 
     Seeded from the session log on first sight, which is accurate for an instance that
     is not busy. Transitions seen while the app runs are timed directly.
@@ -98,12 +118,18 @@ class StateClock:
 
     def __init__(self):
         self.seen = {}
+        self.woke = []       # instances that entered `wait` during the last update
 
     def update(self, instances):
         now = time.time()
+        self.woke = []
         for i in instances:
             state, since = self.seen.get(i.pid, (None, None))
             i.since = (i.last_write or now) if state is None else (since if state == i.state else now)
+            # first sight is not a transition, so starting up is silent no matter how
+            # many instances are already waiting
+            if state is not None and state != i.state == "wait":
+                self.woke.append(i)
             self.seen[i.pid] = (i.state, i.since)
         live = {i.pid for i in instances}
         self.seen = {pid: v for pid, v in self.seen.items() if pid in live}
@@ -363,7 +389,7 @@ STATE = {
     "free": ("◌ free", "#626262"),
     "busy": ("◐ busy", "#80c9be"),
 }
-STATE_ORDER = {"wait": 0, "free": 1, "busy": 2}
+STATE_ORDER = {"wait": 0, "busy": 1, "free": 2}
 SORTS = ("state", "path")
 KEY = "bold #ceaadf"
 KEYS = Text.assemble(("enter", KEY), " jump   ", ("esc", KEY), " quit   ", ("^s", KEY), " sort")
@@ -455,6 +481,8 @@ class CCJump(App):
 
     def reload(self):
         self.instances = self.clock.update(discover())
+        if self.clock.woke:          # one sound per pass, not one per instance
+            play()
         self.draw()
 
     def visible(self):
