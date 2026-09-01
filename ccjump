@@ -18,7 +18,8 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 
 HOME = os.path.expanduser("~")
 
@@ -38,9 +39,13 @@ class Instance:
     pane: str = ""
     session: str = ""
     window: str = ""
+    pane_index: str = ""
+    tab: str = ""            # window index, only when the session holds >1 claude
     path: str = ""
     summary: str = ""
     state: str = "idle"
+    last_write: float = 0    # epoch claude last wrote to its session log
+    since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
     client_pid: str = ""
 
@@ -50,7 +55,57 @@ class Instance:
 
     @property
     def short_path(self):
-        return self.path.replace(HOME, "~") if self.path else "?"
+        path = self.path.replace(HOME, "~") if self.path else "?"
+        return f"{path}:{self.tab}" if self.tab else path
+
+    @property
+    def age(self):
+        return fmt_age(time.time() - self.since) if self.since else "?"
+
+
+def fmt_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
+def last_write(path):
+    """When claude last wrote a message for this cwd, from its session log's mtime.
+
+    tmux's `window_activity` looks like the obvious source and is useless: Claude's TUI
+    repaints constantly, so an idle pane still reports activity ~now. The session log is
+    only appended on real messages.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]", "-", path)
+    try:
+        entries = os.scandir(f"{HOME}/.claude/projects/{slug}")
+        return max(e.stat().st_mtime for e in entries if e.name.endswith(".jsonl"))
+    except (OSError, ValueError):
+        return 0
+
+
+class StateClock:
+    """When each instance entered its current state.
+
+    Seeded from the session log on first sight, which is accurate for an instance that is
+    sitting idle or waiting. Transitions seen while the app runs are timed directly.
+    """
+
+    def __init__(self):
+        self.seen = {}
+
+    def update(self, instances):
+        now = time.time()
+        for i in instances:
+            state, since = self.seen.get(i.pid, (None, None))
+            i.since = (i.last_write or now) if state is None else (since if state == i.state else now)
+            self.seen[i.pid] = (i.state, i.since)
+        live = {i.pid for i in instances}
+        self.seen = {pid: v for pid, v in self.seen.items() if pid in live}
+        return instances
 
 
 IS_CLAUDE = re.compile(r"(^|/)claude(\s|$)|\.claude/local/.*cli\.js")
@@ -85,7 +140,7 @@ def pane_state(text):
 
 def discover():
     procs = processes()
-    panes = tmux_rows("list-panes", ["session_name", "window_index", "pane_id",
+    panes = tmux_rows("list-panes", ["session_name", "window_index", "pane_index", "pane_id",
                                      "pane_pid", "pane_current_path", "pane_title"], "-a")
     clients = tmux_rows("list-clients", ["client_tty", "client_pid", "client_session"])
     pane_by_pid = {int(p["pane_pid"]): p for p in panes}
@@ -112,13 +167,30 @@ def discover():
             pane=pane["pane_id"],
             session=pane["session_name"],
             window=pane["window_index"],
+            pane_index=pane["pane_index"],
             path=pane["pane_current_path"],
             summary=pane["pane_title"].lstrip("✳✶✻✽* ·") or "claude",
             state=pane_state(capture(pane["pane_id"])),
+            last_write=last_write(pane["pane_current_path"]),
             client_tty=client.get("client_tty", ""),
             client_pid=client.get("client_pid", ""),
         ))
+    tag_tabs(found)
     return sorted(found, key=lambda i: (i.short_path, i.pid))
+
+
+def tag_tabs(found):
+    """Tab suffix for the path, but only where it disambiguates.
+
+    One kitty window shows one tmux window at a time, so the tab number only matters when
+    a session holds more than one claude. Two in the same window get `:N.M` with the pane.
+    """
+    for i in found:
+        peers = [p for p in found if p.session and p.session == i.session]
+        if len(peers) < 2:
+            continue
+        same_window = [p for p in peers if p.window == i.window]
+        i.tab = f"{i.window}.{i.pane_index}" if len(same_window) > 1 else i.window
 
 
 # `kitten @` writes a bare `ESC P @kitty-cmd {...} ESC \` to the tty. tmux forwards only
@@ -147,8 +219,7 @@ def send_kitty(command, payload):
 
 def jump(inst):
     if not inst.pane:
-        print(f"pid {inst.pid} is not inside tmux; nothing to focus", file=sys.stderr)
-        return
+        return f"pid {inst.pid} is not inside tmux; nothing to focus"
     if inst.client_tty:
         sh("tmux", "switch-client", "-c", inst.client_tty, "-t", inst.session)
     elif os.environ.get("TMUX"):
@@ -159,78 +230,187 @@ def jump(inst):
         send_kitty("focus-window", {"match": inst.match})
     if sys.platform == "darwin":
         sh("open", "-a", "kitty")
+    return f"focused {inst.short_path}"
 
 
 # ----------------------------------------------------------------------------- ui
 
 from textual.app import App, ComposeResult          # noqa: E402
-from textual.widgets import DataTable, Footer, Header  # noqa: E402
+from textual.binding import Binding                 # noqa: E402
+from textual.containers import Horizontal           # noqa: E402
+from textual.theme import Theme                     # noqa: E402
+from textual.widgets import DataTable, Rule, Static  # noqa: E402
 from rich.text import Text                          # noqa: E402
 
+# Built from ~/.config/kitty/kitty.conf so the app matches the terminal it runs in:
+# color13 #ceaadf (bright purple), color5 #b8a0be (mauve), background #000.
+PURPLE = Theme(
+    name="ccjump",
+    primary="#ceaadf",
+    secondary="#b8a0be",
+    accent="#ceaadf",
+    foreground="#eeeeee",
+    background="#000000",
+    surface="#0e0b12",
+    panel="#181020",
+    warning="#eccd58",
+    error="#df6565",
+    success="#c4d15b",
+    dark=True,
+)
+
 STATE = {
-    "waiting": ("● waiting", "bold yellow"),
-    "busy": ("◐ busy", "cyan"),
-    "idle": ("○ idle", "grey50"),
+    "waiting": ("● waiting", "bold #ceaadf"),
+    "busy": ("◐ busy", "#80c9be"),
+    "idle": ("○ idle", "#626262"),
 }
+STATE_ORDER = {"idle": 0, "waiting": 1, "busy": 2}
+SORTS = ("state", "path")
+KEY = "bold #ceaadf"
+KEYS = Text.assemble(("enter", KEY), " jump   ", ("esc", KEY), " quit   ", ("^s", KEY), " sort")
+
+
+class Table(DataTable):
+    BINDINGS = [Binding("enter", "select_cursor", "jump", show=True)]
+
+    def on_click(self, event):
+        """Select on the first click. DataTable moves the cursor on click and only
+        selects on a second click; its own `_on_click` has already run by now, so the
+        cursor is on the clicked row. Cell meta carries row -1 for the header."""
+        if event.style.meta.get("row", -1) >= 0:
+            self.action_select_cursor()
 
 
 class CCJump(App):
     CSS = """
-    Screen { background: $surface; }
-    DataTable { height: 1fr; padding: 0 1; }
-    DataTable > .datatable--cursor { background: $accent; color: $text; }
+    Screen { background: $background; }
+    #bar { height: 1; background: $panel; }
+    #search { width: 1fr; padding: 0 1; }
+    #status { width: auto; padding: 0 2; color: $secondary; }
+    #keys { width: auto; padding: 0 1; }
+    Rule { height: 1; margin: 0; color: #35284a; }
+    Table { height: 1fr; padding: 0 1; background: $background; scrollbar-size-horizontal: 0; }
+    Table > .datatable--cursor { background: #2a1e38; text-style: bold; }
+    Table > .datatable--header { background: $background; color: $secondary; }
     """
-    TITLE = "claude code"
+    ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
-        ("escape,q", "quit", "quit"),
-        ("r", "reload", "refresh"),
+        Binding("escape", "quit", "quit"),
+        Binding("ctrl+s", "cycle_sort", "sort"),
     ]
 
-    instances: list[Instance] = []
+    def __init__(self):
+        super().__init__()
+        self.clock = StateClock()
+        self.instances = []
+        self.rows = []
+        self.filter = ""
+        self.sort = SORTS[0]
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield DataTable(cursor_type="row", zebra_stripes=False)
-        yield Footer()
+        with Horizontal(id="bar"):
+            yield Static(id="search")
+            yield Static(id="status")
+            yield Static(KEYS, id="keys")
+        yield Rule(line_style="solid")
+        yield Table(cursor_type="row", zebra_stripes=False)
 
     def on_mount(self):
-        table = self.query_one(DataTable)
-        table.add_column("state", width=11)
-        table.add_column("path", width=34)
+        self.register_theme(PURPLE)
+        self.theme = "ccjump"
+        table = self.query_one(Table)
+        table.add_column("state", width=10)
+        table.add_column("for", width=5)
+        table.add_column("path", width=26)
         table.add_column("summary")
-        self.action_reload()
-        self.set_interval(2.0, self.action_reload)
+        self.reload()
+        self.set_interval(1.5, self.reload)
 
-    def action_reload(self):
-        table = self.query_one(DataTable)
-        row = table.cursor_row
-        self.instances = discover()
+    def reload(self):
+        self.instances = self.clock.update(discover())
+        self.draw()
+
+    def visible(self):
+        rows = self.instances
+        if self.filter:
+            needle = self.filter.lower()
+            rows = [i for i in rows
+                    if needle in i.short_path.lower() or needle in i.summary.lower()]
+        if self.sort == "state":
+            # idle first, and within a state the one stuck there longest on top
+            return sorted(rows, key=lambda i: (STATE_ORDER[i.state], i.since))
+        return sorted(rows, key=lambda i: (i.short_path, i.pid))
+
+    def draw(self):
+        table = self.query_one(Table)
+        # follow the instance under the cursor, not the row number: sorting by state
+        # reorders rows as instances change state, and the cursor would drift
+        under = self.rows[table.cursor_row].pid if 0 <= table.cursor_row < len(self.rows) else None
+        self.rows = self.visible()
         table.clear()
-        for inst in self.instances:
+        for inst in self.rows:
             mark, style = STATE[inst.state]
-            table.add_row(Text(mark, style=style), Text(inst.short_path),
-                          Text(inst.summary, style="none" if inst.state == "waiting" else "grey70"))
-        if self.instances:
-            table.move_cursor(row=min(row, len(self.instances) - 1))
+            table.add_row(
+                Text(mark, style=style),
+                Text(inst.age, style="#626262"),
+                Text(inst.short_path, style="#b8a0be"),
+                Text(inst.summary, style="#eeeeee" if inst.state == "waiting" else "#9a9aa0"),
+            )
+        if self.rows:
+            keep = next((n for n, i in enumerate(self.rows) if i.pid == under), None)
+            table.move_cursor(row=keep if keep is not None else 0)
+
         waiting = sum(i.state == "waiting" for i in self.instances)
-        self.sub_title = f"{len(self.instances)} running" + (f", {waiting} waiting" if waiting else "")
+        self.title = f"claude code · {len(self.instances)} running"
+        self.query_one("#search", Static).update(
+            Text(f"/{self.filter}", style="#ceaadf") if self.filter
+            else Text("type to filter", style="#4a4a55"))
+        count = (f"{len(self.rows)} of {len(self.instances)} running" if self.filter
+                 else f"{len(self.instances)} running")
+        self.query_one("#status", Static).update(Text.assemble(
+            (count, "#b8a0be"),
+            ((f", {waiting} waiting", "bold #ceaadf") if waiting else ("", "")),
+            (f"  ·  by {self.sort}", "#b8a0be")))
+
+    # any printable key filters; nothing else in the app consumes plain characters
+    def on_key(self, event):
+        if event.key == "backspace":
+            self.filter = self.filter[:-1]
+        elif event.character and event.character.isprintable():
+            self.filter += event.character
+        else:
+            return
+        event.stop()
+        self.draw()
+
+    def action_cycle_sort(self):
+        self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+        self.draw()
+
+    def action_jump(self):
+        """Focus the picked instance and stay open. Only escape quits."""
+        row = self.query_one(Table).cursor_row
+        if 0 <= row < len(self.rows):
+            self.notify(jump(self.rows[row]), timeout=2)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        if self.instances:
-            self.exit(self.instances[event.cursor_row])
+        self.action_jump()
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected):
+        if (label := str(event.label)) in SORTS:      # clicking a header sorts by it
+            self.sort = label
+            self.draw()
 
 
 # ---------------------------------------------------------------------------- cli
 
 def cmd_ui():
-    picked = CCJump().run()
-    if picked:
-        jump(picked)
+    CCJump().run()
 
 
 def cmd_list():
-    for i in discover():
-        print(f"{STATE[i.state][0]:<10} {i.short_path:<30} {i.summary}")
+    for i in StateClock().update(discover()):
+        print(f"{STATE[i.state][0]:<10} {i.age:>4}  {i.short_path:<30} {i.summary}")
 
 
 def cmd_doctor():
@@ -245,7 +425,7 @@ def cmd_doctor():
 def cmd_focus(pid=None):
     for i in discover():
         if str(i.pid) == pid:
-            return jump(i)
+            return print(jump(i))
     print(f"no claude instance with pid {pid}", file=sys.stderr)
 
 
