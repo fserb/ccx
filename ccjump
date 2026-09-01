@@ -13,11 +13,13 @@ The tmux client is a direct child of kitty (`zsh -l -c tmux` execs tmux), so the
 pid is the kitty window's own child pid and `match pid:N` identifies the window.
 """
 
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import termios
 import time
 from dataclasses import dataclass
 
@@ -218,6 +220,7 @@ def send_kitty(command, payload):
 
 
 def jump(inst):
+    """Focus the instance. Returns an error message, or None when it worked."""
     if not inst.pane:
         return f"pid {inst.pid} is not inside tmux; nothing to focus"
     if inst.client_tty:
@@ -230,7 +233,44 @@ def jump(inst):
         send_kitty("focus-window", {"match": inst.match})
     if sys.platform == "darwin":
         sh("open", "-a", "kitty")
-    return f"focused {inst.short_path}"
+    return None
+
+
+# quitting calls os._exit (see App.action_quit), which skips every `finally`, so anything
+# that has to run before the process dies registers itself here
+ON_EXIT = []
+
+
+@contextlib.contextmanager
+def tmux_window_name(name):
+    """Name our own tmux window for as long as the app runs.
+
+    tmux's automatic-rename uses the pane's foreground command, and the `uv run --script`
+    shebang keeps uv as that process, so the tab reads `uv`. `allow-rename` is off by
+    default, so the ESC k escape is ignored and only `rename-window` works; it also turns
+    automatic-rename off for the window, hence the restore.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        yield
+        return
+    was = sh("tmux", "display-message", "-p", "-t", pane,
+             "#{automatic-rename}\t#{window_name}").strip()
+    sh("tmux", "rename-window", "-t", pane, name)
+
+    def restore():
+        auto, _, before = was.partition("\t")
+        if auto == "1" or not before:
+            sh("tmux", "set-window-option", "-t", pane, "automatic-rename", "on")
+        else:
+            sh("tmux", "rename-window", "-t", pane, before)
+
+    ON_EXIT.append(restore)
+    try:
+        yield
+    finally:
+        ON_EXIT.remove(restore)
+        restore()
 
 
 # ----------------------------------------------------------------------------- ui
@@ -268,6 +308,31 @@ STATE_ORDER = {"idle": 0, "waiting": 1, "busy": 2}
 SORTS = ("state", "path")
 KEY = "bold #ceaadf"
 KEYS = Text.assemble(("enter", KEY), " jump   ", ("esc", KEY), " quit   ", ("^s", KEY), " sort")
+
+
+def fuzzy(needle, hay):
+    """Subsequence match. Returns (score, matched indices) or None; lowest score wins.
+
+    Greedy forward to prove the match exists, then greedy backward from the last hit,
+    which pulls the matched characters as far right as they will go and so collapses
+    "ccj" onto the `ccj` in ccjump instead of scattering it over ~/prj/wrangler.
+    Every character skipped costs 2, or 1 when the match lands on a word start, so a
+    match at the head of a path segment beats one buried mid-word."""
+    low = hay.lower()
+    idx, at = [], 0
+    for c in needle:
+        at = low.find(c, at)
+        if at < 0:
+            return None
+        idx.append(at)
+        at += 1
+    for n in range(len(idx) - 2, -1, -1):
+        idx[n] = low.rfind(needle[n], 0, idx[n + 1])
+    score = 0
+    for n, i in enumerate(idx):
+        gap = i - idx[n - 1] - 1 if n else i
+        score += gap * (1 if i == 0 or not hay[i - 1].isalnum() else 2)
+    return score, idx
 
 
 class Table(DataTable):
@@ -331,15 +396,28 @@ class CCJump(App):
         self.draw()
 
     def visible(self):
-        rows = self.instances
-        if self.filter:
-            needle = self.filter.lower()
-            rows = [i for i in rows
-                    if needle in i.short_path.lower() or needle in i.summary.lower()]
-        if self.sort == "state":
-            # idle first, and within a state the one stuck there longest on top
-            return sorted(rows, key=lambda i: (STATE_ORDER[i.state], i.since))
-        return sorted(rows, key=lambda i: (i.short_path, i.pid))
+        # idle first, and within a state the one stuck there longest on top
+        key = ((lambda i: (STATE_ORDER[i.state], i.since)) if self.sort == "state"
+               else (lambda i: (i.short_path, i.pid)))
+        if not self.filter:
+            return sorted(self.instances, key=key)
+        needle = self.filter.lower()
+        scored = []
+        for i in self.instances:
+            hits = [h for h in (fuzzy(needle, i.short_path), fuzzy(needle, i.summary)) if h]
+            if hits:
+                scored.append((min(s for s, _ in hits), i))
+        # a filter outranks the sort: you typed those keys to reach one row, so the
+        # closest match goes on top and enter takes it
+        return [i for _, i in sorted(scored, key=lambda p: (p[0], key(p[1])))]
+
+    def mark(self, text, style):
+        """Paint the matched characters, so a loose match shows what it matched on."""
+        out = Text(text, style=style)
+        hit = fuzzy(self.filter.lower(), text) if self.filter else None
+        for i in hit[1] if hit else ():
+            out.stylize(KEY, i, i + 1)
+        return out
 
     def draw(self):
         table = self.query_one(Table)
@@ -353,8 +431,8 @@ class CCJump(App):
             table.add_row(
                 Text(mark, style=style),
                 Text(inst.age, style="#626262"),
-                Text(inst.short_path, style="#b8a0be"),
-                Text(inst.summary, style="#eeeeee" if inst.state == "waiting" else "#9a9aa0"),
+                self.mark(inst.short_path, "#b8a0be"),
+                self.mark(inst.summary, "#eeeeee" if inst.state == "waiting" else "#9a9aa0"),
             )
         if self.rows:
             keep = next((n for n, i in enumerate(self.rows) if i.pid == under), None)
@@ -383,6 +461,40 @@ class CCJump(App):
         event.stop()
         self.draw()
 
+    def action_quit(self):
+        """Leave without Textual's shutdown, which costs ~200ms of waiting.
+
+        `App.exit()` ends in `LinuxDriver.disable_input`, which joins the input thread;
+        that thread polls stdin with a 0.1s timeout and then polls once more on the way
+        out, so the join alone measures 0.205s. Undoing application mode is only the
+        writes below plus `tcsetattr`, so do them and go: 0.36s to 0.12s. What is left is
+        tmux hiding kitty's keyboard protocol from us (`extended-keys off`), so a bare
+        ESC is ambiguous and Textual's parser waits ~100ms for the rest of a sequence.
+
+        Every attribute touched here is Textual-private; if an upgrade moves one, fall
+        back to the slow exit rather than leaving the terminal in application mode.
+        """
+        driver = self._driver
+        try:
+            driver._disable_bracketed_paste()
+            driver._enable_line_wrap()
+            driver._disable_in_band_window_resize()
+            driver._disable_mouse_support()
+            driver.write("\x1b[<u")      # kitty keyboard protocol off, before alt screen
+            driver.write("\x1b[?1049l")  # leave the alt screen
+            driver.write("\x1b[?25h")    # show the cursor
+            driver.write("\x1b[?1004l")  # FocusIn/FocusOut off
+            if driver.attrs_before is not None:
+                with contextlib.suppress(termios.error):
+                    termios.tcsetattr(driver.fileno, termios.TCSANOW, driver.attrs_before)
+            driver._writer_thread.stop()  # drains the write queue, then joins
+        except Exception:
+            self.exit()
+            return
+        for cleanup in ON_EXIT:
+            cleanup()
+        os._exit(0)
+
     def action_cycle_sort(self):
         self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
         self.draw()
@@ -391,7 +503,8 @@ class CCJump(App):
         """Focus the picked instance and stay open. Only escape quits."""
         row = self.query_one(Table).cursor_row
         if 0 <= row < len(self.rows):
-            self.notify(jump(self.rows[row]), timeout=2)
+            if err := jump(self.rows[row]):        # silent on success, toast on failure
+                self.notify(err, severity="warning", timeout=2)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         self.action_jump()
@@ -405,7 +518,8 @@ class CCJump(App):
 # ---------------------------------------------------------------------------- cli
 
 def cmd_ui():
-    CCJump().run()
+    with tmux_window_name("ccjump"):
+        CCJump().run()
 
 
 def cmd_list():
@@ -425,7 +539,9 @@ def cmd_doctor():
 def cmd_focus(pid=None):
     for i in discover():
         if str(i.pid) == pid:
-            return print(jump(i))
+            if err := jump(i):
+                print(err, file=sys.stderr)
+            return
     print(f"no claude instance with pid {pid}", file=sys.stderr)
 
 
