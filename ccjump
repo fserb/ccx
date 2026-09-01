@@ -500,15 +500,10 @@ STATE = {
 STATE_ORDER = {"wait": 0, "busy": 1, "free": 2}
 SORTS = ("state", "path")
 KEY = "bold #ceaadf"
-KEYS = Text.assemble(("⇧1-0", KEY), "/", ("enter", KEY), " jump   ",
+KEYS = Text.assemble(("1-0", KEY), "/", ("enter", KEY), " jump   ",
                      ("esc", KEY), " quit   ", ("^s", KEY), " sort")
 
-# shift+<digit> jumps to a numbered row. It arrives as the shifted *character*, never as
-# a key named "shift+1": tmux runs with extended-keys off, so the kitty keyboard protocol
-# Textual enables never reaches kitty; and even when it does reach it, Textual's CSI-u
-# parser drops the shift token whenever the key carries non-space text, so shift+1 is
-# "exclamation_mark" with character "!". US layout, which is what the digits above match.
-PICK = {c: n for n, c in enumerate("!@#$%^&*()")}
+# the digits label the first ten rows, in the order they are drawn
 NUMBERS = "1234567890"
 
 
@@ -589,7 +584,7 @@ class CCJump(App):
         self.register_theme(PURPLE)
         self.theme = "ccjump"
         table = self.query_one(Table)
-        table.add_column("", width=1)          # the shift+<digit> that jumps to the row
+        table.add_column("", width=1)          # the digit that jumps to the row
         table.add_column("state", width=6)
         table.add_column("for", width=5)
         table.add_column("path", width=26)
@@ -659,11 +654,11 @@ class CCJump(App):
             ((f", {waiting} waiting", "bold #ffd700") if waiting else ("", "")),
             (f"  ·  by {self.sort}", "#b8a0be")))
 
-    # a shifted digit picks its row; any other printable key filters
+    # a digit typed into an empty filter picks its row; any other printable key filters
     def on_key(self, event):
-        if (n := PICK.get(event.character)) is not None:
+        if not self.filter and event.character in NUMBERS:
             event.stop()
-            self.jump_row(n)
+            self.jump_row(NUMBERS.index(event.character))
             return
         if event.key == "backspace":
             self.filter = self.filter[:-1]
