@@ -663,7 +663,7 @@ class CCJump(App):
 
     # a digit typed into an empty filter picks its row; any other printable key filters
     def on_key(self, event):
-        if not self.filter and event.character in NUMBERS:
+        if not self.filter and event.character and event.character in NUMBERS:
             event.stop()
             self.jump_row(NUMBERS.index(event.character))
             return
