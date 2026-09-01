@@ -1,0 +1,258 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["textual"]
+# ///
+"""Pick a running Claude Code instance and focus its kitty window + tmux pane.
+
+Mapping chain, verified on this setup:
+
+    claude pid --(walk ppid)--> tmux pane_pid --> session --> client_pid --> kitty window
+
+The tmux client is a direct child of kitty (`zsh -l -c tmux` execs tmux), so the client
+pid is the kitty window's own child pid and `match pid:N` identifies the window.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+HOME = os.path.expanduser("~")
+
+# --------------------------------------------------------------------------- work
+
+def sh(*args, timeout=4):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+@dataclass
+class Instance:
+    pid: int
+    pane: str = ""
+    session: str = ""
+    window: str = ""
+    path: str = ""
+    summary: str = ""
+    state: str = "idle"
+    client_tty: str = ""
+    client_pid: str = ""
+
+    @property
+    def match(self):
+        return f"pid:{self.client_pid}" if self.client_pid else None
+
+    @property
+    def short_path(self):
+        return self.path.replace(HOME, "~") if self.path else "?"
+
+
+IS_CLAUDE = re.compile(r"(^|/)claude(\s|$)|\.claude/local/.*cli\.js")
+PS_LINE = re.compile(r"\s*(\d+)\s+(\d+)\s+(.*)")
+
+
+def processes():
+    table = {}
+    for line in sh("ps", "-axo", "pid=,ppid=,command=").splitlines():
+        if m := PS_LINE.match(line):
+            table[int(m[1])] = (int(m[2]), m[3])
+    return table
+
+
+def tmux_rows(subcommand, fields, *extra):
+    fmt = "\t".join(f"#{{{f}}}" for f in fields)
+    out = sh("tmux", subcommand, *extra, "-F", fmt)
+    return [dict(zip(fields, line.split("\t"))) for line in out.splitlines() if line]
+
+
+def capture(pane, lines=40):
+    return sh("tmux", "capture-pane", "-p", "-t", pane, "-S", f"-{lines}")
+
+
+def pane_state(text):
+    if re.search(r"Do you want|Would you like|❯ 1\.", text):
+        return "waiting"
+    if "esc to interrupt" in text:
+        return "busy"
+    return "idle"
+
+
+def discover():
+    procs = processes()
+    panes = tmux_rows("list-panes", ["session_name", "window_index", "pane_id",
+                                     "pane_pid", "pane_current_path", "pane_title"], "-a")
+    clients = tmux_rows("list-clients", ["client_tty", "client_pid", "client_session"])
+    pane_by_pid = {int(p["pane_pid"]): p for p in panes}
+    client_by_session = {c["client_session"]: c for c in clients}
+
+    found = []
+    for pid, (_, cmd) in procs.items():
+        if not IS_CLAUDE.search(cmd):
+            continue
+        pane, cur = None, pid
+        for _ in range(12):                      # walk up to the owning pane
+            if cur in pane_by_pid:
+                pane = pane_by_pid[cur]
+                break
+            if cur not in procs:
+                break
+            cur = procs[cur][0]
+        if not pane:
+            found.append(Instance(pid=pid, summary=cmd, state="idle"))
+            continue
+        client = client_by_session.get(pane["session_name"], {})
+        found.append(Instance(
+            pid=pid,
+            pane=pane["pane_id"],
+            session=pane["session_name"],
+            window=pane["window_index"],
+            path=pane["pane_current_path"],
+            summary=pane["pane_title"].lstrip("✳✶✻✽* ·") or "claude",
+            state=pane_state(capture(pane["pane_id"])),
+            client_tty=client.get("client_tty", ""),
+            client_pid=client.get("client_pid", ""),
+        ))
+    return sorted(found, key=lambda i: (i.short_path, i.pid))
+
+
+# `kitten @` writes a bare `ESC P @kitty-cmd {...} ESC \` to the tty. tmux forwards only
+# `ESC P tmux; ... ESC \`, so the bare form is swallowed and the command never reaches
+# kitty (silently, with --no-response). So build the sequence here and wrap it.
+KITTY_RC_VERSION = [0, 26, 0]
+
+
+def send_kitty(command, payload):
+    msg = {"cmd": command, "version": KITTY_RC_VERSION, "no_response": True,
+           "payload": payload}
+    if wid := os.environ.get("KITTY_WINDOW_ID"):
+        msg["kitty_window_id"] = int(wid)
+    seq = f"\x1bP@kitty-cmd{json.dumps(msg, separators=(',', ':'))}\x1b\\"
+    if os.environ.get("TMUX"):
+        seq = f"\x1bPtmux;{seq.replace(chr(27), chr(27) * 2)}\x1b\\"
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(seq)
+            tty.flush()
+        return True
+    except OSError as e:
+        print(f"cannot write to /dev/tty: {e}", file=sys.stderr)
+        return False
+
+
+def jump(inst):
+    if not inst.pane:
+        print(f"pid {inst.pid} is not inside tmux; nothing to focus", file=sys.stderr)
+        return
+    if inst.client_tty:
+        sh("tmux", "switch-client", "-c", inst.client_tty, "-t", inst.session)
+    elif os.environ.get("TMUX"):
+        sh("tmux", "switch-client", "-t", inst.session)
+    sh("tmux", "select-window", "-t", f"{inst.session}:{inst.window}")
+    sh("tmux", "select-pane", "-t", inst.pane)
+    if inst.match:
+        send_kitty("focus-window", {"match": inst.match})
+    if sys.platform == "darwin":
+        sh("open", "-a", "kitty")
+
+
+# ----------------------------------------------------------------------------- ui
+
+from textual.app import App, ComposeResult          # noqa: E402
+from textual.widgets import DataTable, Footer, Header  # noqa: E402
+from rich.text import Text                          # noqa: E402
+
+STATE = {
+    "waiting": ("● waiting", "bold yellow"),
+    "busy": ("◐ busy", "cyan"),
+    "idle": ("○ idle", "grey50"),
+}
+
+
+class CCJump(App):
+    CSS = """
+    Screen { background: $surface; }
+    DataTable { height: 1fr; padding: 0 1; }
+    DataTable > .datatable--cursor { background: $accent; color: $text; }
+    """
+    TITLE = "claude code"
+    BINDINGS = [
+        ("escape,q", "quit", "quit"),
+        ("r", "reload", "refresh"),
+    ]
+
+    instances: list[Instance] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(cursor_type="row", zebra_stripes=False)
+        yield Footer()
+
+    def on_mount(self):
+        table = self.query_one(DataTable)
+        table.add_column("state", width=11)
+        table.add_column("path", width=34)
+        table.add_column("summary")
+        self.action_reload()
+        self.set_interval(2.0, self.action_reload)
+
+    def action_reload(self):
+        table = self.query_one(DataTable)
+        row = table.cursor_row
+        self.instances = discover()
+        table.clear()
+        for inst in self.instances:
+            mark, style = STATE[inst.state]
+            table.add_row(Text(mark, style=style), Text(inst.short_path),
+                          Text(inst.summary, style="none" if inst.state == "waiting" else "grey70"))
+        if self.instances:
+            table.move_cursor(row=min(row, len(self.instances) - 1))
+        waiting = sum(i.state == "waiting" for i in self.instances)
+        self.sub_title = f"{len(self.instances)} running" + (f", {waiting} waiting" if waiting else "")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        if self.instances:
+            self.exit(self.instances[event.cursor_row])
+
+
+# ---------------------------------------------------------------------------- cli
+
+def cmd_ui():
+    picked = CCJump().run()
+    if picked:
+        jump(picked)
+
+
+def cmd_list():
+    for i in discover():
+        print(f"{STATE[i.state][0]:<10} {i.short_path:<30} {i.summary}")
+
+
+def cmd_doctor():
+    print(f"TMUX={os.environ.get('TMUX', '(none)')}  "
+          f"KITTY_WINDOW_ID={os.environ.get('KITTY_WINDOW_ID', '(none)')}")
+    print(f"tmux allow-passthrough: {sh('tmux', 'show', '-gv', 'allow-passthrough').strip()}")
+    for i in discover():
+        print(f"  pid {i.pid} pane {i.pane or '-'} session {i.session or '-'} "
+              f"state {i.state} match {i.match or '(unresolved)'}")
+
+
+def cmd_focus(pid=None):
+    for i in discover():
+        if str(i.pid) == pid:
+            return jump(i)
+    print(f"no claude instance with pid {pid}", file=sys.stderr)
+
+
+COMMANDS = {"ui": cmd_ui, "list": cmd_list, "doctor": cmd_doctor, "focus": cmd_focus}
+
+if __name__ == "__main__":
+    name, *rest = sys.argv[1:] or ["ui"]
+    if name not in COMMANDS:
+        sys.exit(f"usage: ccjump [{' | '.join(COMMANDS)}]")
+    COMMANDS[name](*rest)
