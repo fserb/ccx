@@ -652,6 +652,10 @@ class CCJump(App):
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
         Binding("escape", "quit", "quit"),
+        # App binds ctrl+c to `help_quit`, which only toasts "Press ctrl+q to quit the
+        # app". Every key that reads as "leave" leaves: ctrl+c, ctrl+q (App's own
+        # priority binding, which reaches action_quit below) and escape
+        Binding("ctrl+c", "quit", "quit", show=False, priority=True),
         Binding("ctrl+s", "cycle_sort", "sort"),
     ]
 
@@ -809,7 +813,7 @@ class CCJump(App):
         self.draw()
 
     def jump_row(self, row):
-        """Focus that instance and stay open. Only escape quits."""
+        """Focus that instance and stay open. Only a quit key quits."""
         if not 0 <= row < len(self.rows):
             return
         self.query_one(Table).move_cursor(row=row)   # so the cursor shows what was taken
