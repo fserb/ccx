@@ -169,6 +169,67 @@ def has_reply(cwd, session_id):
         return False
 
 
+# the last title line was never further than 34KB from the end of the log, over the 108
+# logs on this machine that carry one, so a tail this size finds it with room to spare
+TITLE_TAIL = 256 * 1024
+TITLES = {}              # session log -> (size when read, title found)
+
+
+def session_title(cwd, session_id):
+    """Claude's own name for the session, from the transcript.
+
+    Claude Code generates this once per conversation, from the first real user prompt,
+    with a separate model call, then appends it to the log as an "ai-title" line and puts
+    it in the terminal title. /rename writes a "custom-title" line, which outranks it in
+    the terminal title and here. It is a name for the session, not a live task summary:
+    it does not follow the work as it moves on.
+
+    The log beats pane_title (the terminal title as tmux saw it) on three counts: no
+    glyph to strip, no tmux needed, and it is never stale after /clear, since /clear
+    starts a new sessionId whose log carries no title until one is generated while
+    pane_title keeps the old text for ~a minute.
+
+    The line is re-appended on every prompt, so the last one in the tail is current. The
+    read is cached against the log's size and redone whenever the log has grown, which is
+    what carries a /rename or a first title onto the next poll; a log that has not been
+    written to since the last poll costs one stat. Six logs, all missing, all re-read,
+    measured at 1.8ms against discover()'s ~50ms.
+    """
+    if not (cwd and session_id):
+        return ""
+    path = f"{project_dir(cwd)}/{session_id}.jsonl"
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    size_read, title = TITLES.get(path, (-1, ""))
+    if size == size_read:
+        return title
+    title = read_title(path, size)
+    TITLES[path] = (size, title)
+    return title
+
+
+def read_title(path, size):
+    """The last title in the tail of a session log, /rename's winning over the AI one."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - TITLE_TAIL))
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    found = {}
+    for line in lines:
+        if b'"type":"ai-title"' not in line and b'"type":"custom-title"' not in line:
+            continue
+        try:                                  # the first line of the tail is a fragment
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        found[rec.get("type")] = rec.get("customTitle") or rec.get("aiTitle") or ""
+    return found.get("custom-title") or found.get("ai-title") or ""
+
+
 SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
 PLAYING = []
 
@@ -308,8 +369,12 @@ def pane_state(text):
 
 
 def summary_of(title):
-    """Claude's own task summary, from pane_title. "Claude Code" is the default title
-    a session carries before it has one (and again after /clear), not a summary."""
+    """The session title as pane_title has it, for instances with no record to read.
+
+    "Claude Code" is the literal default the title falls back to before a session has a
+    title of its own, not a title. The leading glyph is Claude's, and under tmux it is
+    always the same one: it detects the multiplexer and stops animating it.
+    """
     text = title.lstrip("✳✶✻✽* ·").strip()
     return "" if text == "Claude Code" else text
 
@@ -337,9 +402,10 @@ def discover():
             if cur not in procs:
                 break
             cur = procs[cur][0]
+        title = session_title(rec.get("cwd", ""), rec.get("sessionId", ""))
         if not pane:
             # nothing to focus without a pane, but the record still knows the rest
-            found.append(Instance(pid=pid, summary=cmd, path=rec.get("cwd", ""),
+            found.append(Instance(pid=pid, summary=title or cmd, path=rec.get("cwd", ""),
                                   state=state, status_since=since))
             continue
         client = client_by_session.get(pane["session_name"], {})
@@ -351,7 +417,10 @@ def discover():
             window=pane["window_index"],
             pane_index=pane["pane_index"],
             path=pane["pane_current_path"],
-            summary=summary_of(pane["pane_title"]),
+            # the transcript is the whole answer once there is a record: it names the
+            # session claude is in *now*, where pane_title still shows the one before a
+            # /clear. pane_title is what is left when there is no record, as with state
+            summary=title if rec else summary_of(pane["pane_title"]),
             state=state or pane_state(capture(pane["pane_id"])),
             status_since=since,
             last_write=0 if state else last_write(pane["pane_current_path"]),
