@@ -7,10 +7,13 @@
 
 Mapping chain, verified on this setup:
 
-    claude pid --(walk ppid)--> tmux pane_pid --> session --> client_pid --> kitty window
+    claude pid --(walk ppid)--> tmux pane_pid --> session --> client_pid
+              --(walk ppid)--> kitty's direct child --> kitty window
 
-The tmux client is a direct child of kitty (`zsh -l -c tmux` execs tmux), so the client
-pid is the kitty window's own child pid and `match pid:N` identifies the window.
+kitty matches a window only by its *direct* child pid. `zsh -l -c tmux` execs tmux and
+the client is that child, but ktmux (kitty.conf's `shell`) keeps its wrapper zsh alive
+between kitty and the client, so the client pid has to be walked up to the ancestor
+whose parent is kitty before `match pid:N` finds the window.
 """
 
 import contextlib
@@ -50,11 +53,11 @@ class Instance:
     last_write: float = 0    # epoch claude last wrote to its session log
     since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
-    client_pid: str = ""
+    kitty_pid: str = ""      # kitty's own child above the tmux client; what `pid:` matches
 
     @property
     def match(self):
-        return f"pid:{self.client_pid}" if self.client_pid else None
+        return f"pid:{self.kitty_pid}" if self.kitty_pid else None
 
     @property
     def short_path(self):
@@ -236,6 +239,27 @@ def processes():
     return table
 
 
+def kitty_child(pid, procs):
+    """The ancestor of a tmux client that `match pid:` will actually find.
+
+    kitty matches a window only by its *direct* child pid. `zsh -l -c tmux` execs tmux
+    and the client is that child, but under ktmux (kitty.conf's `shell`) the wrapper zsh
+    stays alive between kitty and the client, and `pid:<client_pid>` matched nothing,
+    silently: the jump switched panes and moved no window, for every window ktmux had
+    opened. A client with no kitty ancestor (ssh, another terminal) comes back unchanged,
+    which fails the same way it always did.
+    """
+    cur = pid
+    for _ in range(12):
+        ppid, _ = procs.get(cur, (0, ""))
+        if ppid not in procs:
+            return pid
+        if procs[ppid][1].split(" ")[0].rpartition("/")[2] == "kitty":
+            return cur
+        cur = ppid
+    return pid
+
+
 def tmux_rows(subcommand, fields, *extra):
     fmt = "\t".join(f"#{{{f}}}" for f in fields)
     out = sh("tmux", subcommand, *extra, "-F", fmt)
@@ -319,6 +343,7 @@ def discover():
                                   state=state, status_since=since))
             continue
         client = client_by_session.get(pane["session_name"], {})
+        cpid = client.get("client_pid", "")
         found.append(Instance(
             pid=pid,
             pane=pane["pane_id"],
@@ -331,7 +356,7 @@ def discover():
             status_since=since,
             last_write=0 if state else last_write(pane["pane_current_path"]),
             client_tty=client.get("client_tty", ""),
-            client_pid=client.get("client_pid", ""),
+            kitty_pid=str(kitty_child(int(cpid), procs)) if cpid else "",
         ))
     tag_tabs(found)
     return sorted(found, key=lambda i: (i.short_path, i.pid))
@@ -439,10 +464,10 @@ def kitty_window_title(name):
     it also survives a config with `set-titles on`; sending the command with no title at
     all is what puts kitty's default back.
 
-    Target the window by the pid of the tmux client attached to our session, the same
-    `pid:N` match jump() uses. KITTY_WINDOW_ID cannot be trusted here: inside a pane it is
-    inherited from the environment the tmux *server* started in, so it can name a window
-    that closed long ago.
+    Target the window by the client's kitty_child(), the same `pid:N` match jump() uses.
+    KITTY_WINDOW_ID cannot be trusted here: inside a pane it is inherited from the
+    environment the tmux *server* started in, so it can name a window that closed long
+    ago.
     """
     target = {}
     if os.environ.get("TMUX"):
@@ -450,7 +475,7 @@ def kitty_window_title(name):
         if not pid:                          # no client attached, so no window to name
             yield
             return
-        target = {"match": f"pid:{pid}"}
+        target = {"match": f"pid:{kitty_child(int(pid), processes())}"}
     send_kitty("set-window-title", target | {"title": name})
 
     def restore():
