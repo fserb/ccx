@@ -431,21 +431,36 @@ def tag_tabs(found):
 KITTY_RC_VERSION = [0, 26, 0]
 
 
-def send_kitty(command, payload):
+def send_kitty(command, payload, tty=None):
+    """Send one kitty remote-control command. `tty` picks which of two paths it takes.
+
+    A tmux client's tty *is* the pty kitty gave that window, with the client on the other
+    end, so bytes written to it reach kitty directly and the tmux passthrough wrapper is
+    neither needed nor wanted. That path also works from a process with no controlling
+    terminal at all, which is what a menu-bar app is: open("/dev/tty") there fails with
+    ENXIO, so it is the only path that works from one. Verified live from a setsid child:
+    a bare DCS written to another window's client tty focused that window.
+
+    Without a tty it falls back to our own /dev/tty, wrapped for tmux when we are inside
+    it. Both carry an explicit `match`, so either one can drive any window: one kitty
+    process owns every window here (verified: both windows' kitty_child sits under the
+    same kitty pid), and the command names its target rather than inferring it.
+    """
     msg = {"cmd": command, "version": KITTY_RC_VERSION, "no_response": True,
            "payload": payload}
     if wid := os.environ.get("KITTY_WINDOW_ID"):
         msg["kitty_window_id"] = int(wid)
     seq = f"\x1bP@kitty-cmd{json.dumps(msg, separators=(',', ':'))}\x1b\\"
-    if os.environ.get("TMUX"):
+    if not tty and os.environ.get("TMUX"):
         seq = f"\x1bPtmux;{seq.replace(chr(27), chr(27) * 2)}\x1b\\"
+    target = tty or "/dev/tty"
     try:
-        with open("/dev/tty", "w") as tty:
-            tty.write(seq)
-            tty.flush()
+        with open(target, "w") as out:
+            out.write(seq)
+            out.flush()
         return True
     except OSError as e:
-        print(f"cannot write to /dev/tty: {e}", file=sys.stderr)
+        print(f"cannot write to {target}: {e}", file=sys.stderr)
         return False
 
 
@@ -460,7 +475,8 @@ def jump(inst):
     sh("tmux", "select-window", "-t", f"{inst.session}:{inst.window}")
     sh("tmux", "select-pane", "-t", inst.pane)
     if inst.match:
-        send_kitty("focus-window", {"match": inst.match})
+        # the client's own tty, so this works with no controlling terminal of our own
+        send_kitty("focus-window", {"match": inst.match}, tty=inst.client_tty or None)
     if sys.platform == "darwin":
         sh("open", "-a", "kitty")
     return None
