@@ -3,12 +3,13 @@
 # requires-python = ">=3.12"
 # dependencies = ["pyobjc-framework-Cocoa"]
 # ///
-"""A menu bar count of every running Claude Code instance, and a panel that jumps to one.
+"""A menu bar dot per running Claude Code instance, and a panel that jumps to one.
 
-The title is <waiting>/<total>. Clicking it, or pressing the global hotkey, opens a panel
-that lists every instance: type to filter, 1-0 or enter to jump, escape to close. The
-listing, the ordering, the fuzzy filter and the jump are all claudes.py, the same ones the
-TUI uses, so this file is only the drawing and the macOS plumbing.
+The icon is one dot per instance in the smallest square grid that holds them all, colored
+by state. Clicking it, or pressing the global hotkey, opens a panel that lists every one of
+them: type to filter, 1-0 or enter to jump, escape to close. The listing, the ordering, the
+fuzzy filter and the jump are all claudes.py, the same ones the TUI uses, so this file is
+only the drawing and the macOS plumbing.
 
 Two things here were verified before the rest was written, because either one could have
 sunk the design:
@@ -30,6 +31,7 @@ window you are already sitting in.
 """
 
 import ctypes
+import math
 import os
 import subprocess
 import sys
@@ -42,12 +44,13 @@ from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
                     NSEventModifierFlagCommand, NSEventModifierFlagControl,
                     NSEventTypeRightMouseDown, NSFont, NSFontAttributeName,
                     NSFontManager, NSFontWeightRegular,
-                    NSForegroundColorAttributeName, NSLineBreakByTruncatingHead,
-                    NSLineBreakByTruncatingTail, NSMenu, NSMenuItem, NSMutableAttributedString,
+                    NSForegroundColorAttributeName, NSImage, NSImageOnly,
+                    NSLineBreakByTruncatingHead, NSLineBreakByTruncatingTail,
+                    NSMenu, NSMenuItem, NSMutableAttributedString,
                     NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName,
                     NSScreen, NSStatusBar, NSTextAlignmentRight, NSTimer,
                     NSVariableStatusItemLength, NSView, NSWindowStyleMaskBorderless)
-from Foundation import NSMakeRect, NSMaxX, NSMinX, NSMinY, NSObject
+from Foundation import NSMakeRect, NSMakeSize, NSMaxX, NSMinX, NSMinY, NSObject
 
 from claudes import StateClock, discover, fuzzy, jump, play, processes, rank
 
@@ -154,6 +157,56 @@ def text(string, color, font=MONO, hits=(), **kw):
             out.addAttribute_value_range_(NSForegroundColorAttributeName, rgb(ACCENT), (i, 1))
             out.addAttribute_value_range_(NSFontAttributeName, BOLD, (i, 1))
     return out
+
+
+# ---------------------------------------------------------------------------- the icon
+
+ICON = 18                # square, inside the menu bar's 22pt, with room to breathe
+MIN_GRID = 2             # 2x2 is the smallest; one dot filling the icon is a blob
+DOTS = {"wait": rgb("#ffd700"), "busy": rgb("#80c9be")}   # free is labelColor, below
+
+
+def icon(states):
+    """One dot per instance, in the smallest square grid that holds them all.
+
+    Three instances make a 2x2 with a hole in it, five a 3x3, so the shape of the icon is
+    the count and the colors are what those sessions are doing. 2x2 is the floor: the box
+    is a fixed 18pt whatever the grid, so a lone instance in a 1x1 draws one 11pt ball.
+
+    Rank order fills the grid, which puts every gold `wait` dot first: the icon is for
+    telling you at a glance that something wants you, and reading an exact number off the
+    menu bar was never the point.
+
+    `free` is drawn in labelColor rather than the panel's #626262, which would be black on
+    a black menu bar. That is also why the drawing is a handler and not a finished bitmap:
+    AppKit re-runs it whenever the image is drawn, so the dynamic color follows a switch to
+    light mode without us noticing the switch.
+    """
+    grid = max(MIN_GRID, math.ceil(math.sqrt(len(states))))
+    cell = ICON / grid
+    size = cell * 0.62
+
+    def draw(rect):
+        for n, state in enumerate(states):
+            if state in DOTS:
+                DOTS[state].set()
+            else:
+                NSColor.labelColor().colorWithAlphaComponent_(0.45).set()
+            col, row = n % grid, n // grid
+            NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(
+                col * cell + (cell - size) / 2,
+                ICON - (row + 1) * cell + (cell - size) / 2, size, size)).fill()
+        if not states:      # nothing running still needs something to click on
+            ring = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(
+                (cell - size) / 2, ICON - cell + (cell - size) / 2, size, size))
+            ring.setLineWidth_(1.2)
+            NSColor.labelColor().colorWithAlphaComponent_(0.35).set()
+            ring.stroke()
+        return True
+
+    img = NSImage.imageWithSize_flipped_drawingHandler_(NSMakeSize(ICON, ICON), False, draw)
+    img.setTemplate_(False)     # the colors are the message; a template image is one tint
+    return img
 
 
 class ListView(NSView):
@@ -272,9 +325,11 @@ class Systray(NSObject):
         self.selected = None       # the pid under the cursor, not the row number
         self.error = ""
         self.hidden_at = 0.0
+        self.states = None         # what the icon last drew; None so the first poll draws
 
         bar = NSStatusBar.systemStatusBar()
         self.item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+        self.item.button().setImagePosition_(NSImageOnly)
         self.item.button().setTarget_(self)
         self.item.button().setAction_(b"toggle:")
         self.item.button().sendActionOn_(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown)
@@ -311,24 +366,25 @@ class Systray(NSObject):
         shown = self.rows[:MAX_ROWS]
         if not any(i.pid == self.selected for i in shown):
             self.selected = shown[0].pid if shown else None
-        self.retitle()
+        self.reicon()
         if self.panel.isVisible():
             self.layout()
             self.view.setNeedsDisplay_(True)
 
     @objc.python_method
-    def retitle(self):
-        """<waiting>/<total>, with the count that wants you in the color that says so."""
-        waiting = sum(i.state == "wait" for i in self.instances)
-        font = NSFont.monospacedDigitSystemFontOfSize_weight_(13, NSFontWeightRegular)
-        title = NSMutableAttributedString.alloc().initWithString_attributes_(
-            f"{waiting}/{len(self.instances)}",
-            {NSFontAttributeName: font,
-             NSForegroundColorAttributeName: NSColor.labelColor()})
-        if waiting:
-            title.addAttribute_value_range_(NSForegroundColorAttributeName,
-                                            rgb("#ffd700"), (0, 1))
-        self.item.button().setAttributedTitle_(title)
+    def reicon(self):
+        """Redraw the menu bar dots, if what they would say has changed.
+
+        The states in rank order are the whole of the icon, so comparing that list is
+        exactly the redraw test; a poll where nothing moved touches nothing. It has to be
+        the ordered list and not the counts, since which dot is which color is what moves
+        when a session changes state.
+        """
+        states = [i.state for i in rank(self.instances)]
+        if states == self.states:
+            return
+        self.states = states
+        self.item.button().setImage_(icon(states))
 
     @objc.python_method
     def match_marks(self, string):
