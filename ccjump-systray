@@ -1,0 +1,411 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pyobjc-framework-Cocoa"]
+# ///
+"""A menu bar count of every running Claude Code instance, and a panel that jumps to one.
+
+The title is <waiting>/<total>. Clicking it, or pressing the global hotkey, opens a panel
+that lists every instance: type to filter, 1-0 or enter to jump, escape to close. The
+listing, the ordering, the fuzzy filter and the jump are all claudes.py, the same ones the
+TUI uses, so this file is only the drawing and the macOS plumbing.
+
+Two things here were verified before the rest was written, because either one could have
+sunk the design:
+
+- the hotkey is Carbon's RegisterEventHotKey through ctypes. It is the one global-shortcut
+  API that needs neither an .app bundle nor an Accessibility grant, so this stays a script
+  you run rather than an app you install. Measured: both calls return noErr from a plain
+  `uv run --script` process, with no permission prompt, and the handler fires
+- this process has no controlling terminal when launched outside a terminal, where
+  open("/dev/tty") fails with ENXIO. claudes.send_kitty() reaches kitty through the target
+  window's own tmux client tty instead, which needs no tty of our own
+
+Unlike the TUI, jumping closes the panel: this is a launcher you called up to leave, not a
+window you are already sitting in.
+"""
+
+import ctypes
+import sys
+import time
+
+import objc
+from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
+                    NSBackingStoreBuffered, NSBezierPath, NSColor,
+                    NSFont, NSFontAttributeName, NSFontWeightMedium, NSFontWeightRegular,
+                    NSForegroundColorAttributeName, NSLineBreakByTruncatingHead,
+                    NSLineBreakByTruncatingTail, NSMutableAttributedString,
+                    NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName,
+                    NSScreen, NSStatusBar, NSTextAlignmentRight, NSTimer,
+                    NSVariableStatusItemLength, NSView, NSWindowStyleMaskBorderless)
+from Foundation import NSMakeRect, NSMaxX, NSMinX, NSMinY, NSObject
+
+from claudes import StateClock, discover, fuzzy, jump, play, rank
+
+POLL = 1.5               # same cadence as the TUI, so the bell lands as promptly
+NUMBERS = "1234567890"   # the digits label the first ten rows, in the order drawn
+
+# ------------------------------------------------------------------- the global hotkey
+
+carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+
+
+class EventTypeSpec(ctypes.Structure):
+    _fields_ = [("eventClass", ctypes.c_uint32), ("eventKind", ctypes.c_uint32)]
+
+
+class EventHotKeyID(ctypes.Structure):
+    _fields_ = [("signature", ctypes.c_uint32), ("id", ctypes.c_uint32)]
+
+
+HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
+                           ctypes.c_void_p)
+CMD, SHIFT, OPTION, CONTROL = 0x0100, 0x0200, 0x0800, 0x1000
+HOTKEY = (0x26, CONTROL | OPTION | CMD)     # ctrl+opt+cmd+J; 0x26 is the J key
+REPEAT_GAP = 0.25                           # holding the keys auto-repeats the event
+
+_handler = None          # the ctypes callback, kept alive: Carbon holds only a raw pointer
+
+
+def register_hotkey(fn):
+    """Call fn() when the hotkey is pressed. Returns the OSStatus of the registration."""
+    global _handler
+    last = [0.0]
+
+    def fired(caller, event, user_data):
+        now = time.monotonic()
+        if now - last[0] > REPEAT_GAP:      # a held key repeats; one press is one toggle
+            last[0] = now
+            fn()
+        return 0
+
+    _handler = HANDLER(fired)
+    carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
+    carbon.InstallEventHandler.argtypes = [ctypes.c_void_p, HANDLER, ctypes.c_ulong,
+                                           ctypes.POINTER(EventTypeSpec), ctypes.c_void_p,
+                                           ctypes.c_void_p]
+    carbon.RegisterEventHotKey.argtypes = [ctypes.c_uint32, ctypes.c_uint32, EventHotKeyID,
+                                           ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_void_p)]
+    target = carbon.GetApplicationEventTarget()
+    spec = EventTypeSpec(int.from_bytes(b"keyb", "big"), 5)   # kEventHotKeyPressed
+    carbon.InstallEventHandler(target, _handler, 1, ctypes.byref(spec), None, None)
+    ref = ctypes.c_void_p()
+    key, mods = HOTKEY
+    return carbon.RegisterEventHotKey(key, mods, EventHotKeyID(0x63636A70, 1), target, 0,
+                                      ctypes.byref(ref))
+
+
+# -------------------------------------------------------------------------- the drawing
+
+WIDTH = 620
+ROW = 22                 # one instance
+HEAD = 24                # the filter line
+FOOT = 20                # the key hints
+PAD = 8
+MAX_ROWS = 12            # past this the panel is taller than it is useful; keep typing
+
+NUM_X, STATE_X, AGE_X, PATH_X, SUM_X = 10, 28, 84, 126, 330
+
+
+def rgb(text, alpha=1.0):
+    r, g, b = (int(text.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, alpha)
+
+
+# the TUI's palette, out of ~/.config/kitty/kitty.conf, so the two look like one tool
+BG = rgb("#0e0b12", 0.96)
+EDGE = rgb("#35284a")
+ACCENT, MAUVE, DIM, TEXT = "#ceaadf", "#b8a0be", "#626262", "#eeeeee"
+STATE = {"wait": ("● wait", "#ffd700"), "free": ("◌ free", DIM), "busy": ("◐ busy", "#80c9be")}
+
+MONO = NSFont.monospacedSystemFontOfSize_weight_(12, NSFontWeightRegular)
+BOLD = NSFont.monospacedSystemFontOfSize_weight_(12, NSFontWeightMedium)
+
+
+def paragraph(align_right=False, head=False):
+    style = NSMutableParagraphStyle.alloc().init()
+    # a path truncated at the head keeps the part that identifies it, the tail
+    style.setLineBreakMode_(NSLineBreakByTruncatingHead if head else NSLineBreakByTruncatingTail)
+    if align_right:
+        style.setAlignment_(NSTextAlignmentRight)
+    return style
+
+
+def text(string, color, font=MONO, hits=(), **kw):
+    """One field, with the fuzzy match's characters picked out in the accent color."""
+    attrs = {NSForegroundColorAttributeName: rgb(color), NSFontAttributeName: font,
+             NSParagraphStyleAttributeName: paragraph(**kw)}
+    out = NSMutableAttributedString.alloc().initWithString_attributes_(string, attrs)
+    for i in hits:
+        if i < len(string):
+            out.addAttribute_value_range_(NSForegroundColorAttributeName, rgb(ACCENT), (i, 1))
+            out.addAttribute_value_range_(NSFontAttributeName, BOLD, (i, 1))
+    return out
+
+
+class ListView(NSView):
+    """Draws the whole panel and owns its keyboard. One view, no NSTableView.
+
+    A dozen rows of five fields each is less code drawn by hand than it is wired through
+    a table's data source, and drawing it means the fuzzy match's highlighted characters
+    are just another attribute run.
+    """
+
+    def isFlipped(self):
+        return True          # so rows go top-down and y grows the way the list reads
+
+    def acceptsFirstResponder(self):
+        return True
+
+    def drawRect_(self, rect):
+        app = self.app
+        bounds = self.bounds()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 10, 10).addClip()
+        BG.set()
+        NSBezierPath.fillRect_(bounds)
+
+        head = NSMakeRect(PAD + 2, PAD, WIDTH - 2 * PAD, HEAD - 6)
+        if app.filter:
+            text(f"/{app.filter}", ACCENT).drawInRect_(head)
+        else:
+            text("type to filter", "#4a4a55").drawInRect_(head)
+        waiting = sum(i.state == "wait" for i in app.instances)
+        count = (f"{len(app.rows)} of {len(app.instances)}" if app.filter
+                 else f"{len(app.instances)} running")
+        if waiting:
+            count += f", {waiting} waiting"
+        text(count, "#ffd700" if waiting else MAUVE, align_right=True).drawInRect_(head)
+
+        EDGE.set()
+        NSBezierPath.fillRect_(NSMakeRect(0, PAD + HEAD - 5, WIDTH, 1))
+
+        top = PAD + HEAD
+        if not app.rows:
+            text("no claude instances" if not app.instances else "nothing matches", DIM,
+                 ).drawInRect_(NSMakeRect(PAD + 2, top + 3, WIDTH, ROW))
+        for n, inst in enumerate(app.rows[:MAX_ROWS]):
+            y = top + n * ROW
+            if inst.pid == app.selected:
+                rgb("#2a1e38").set()
+                NSBezierPath.fillRect_(NSMakeRect(2, y, WIDTH - 4, ROW))
+            label, color = STATE[inst.state]
+            ty = y + 3
+            text(NUMBERS[n] if n < len(NUMBERS) else " ", DIM).drawInRect_(
+                NSMakeRect(NUM_X, ty, 14, ROW))
+            text(label, color, font=BOLD).drawInRect_(NSMakeRect(STATE_X, ty, 52, ROW))
+            text(inst.age, DIM, align_right=True).drawInRect_(NSMakeRect(AGE_X, ty, 34, ROW))
+            text(inst.short_path, MAUVE, hits=app.match_marks(inst.short_path), head=True
+                 ).drawInRect_(NSMakeRect(PATH_X, ty, SUM_X - PATH_X - 8, ROW))
+            text(inst.summary, TEXT if inst.state == "wait" else "#9a9aa0",
+                 hits=app.match_marks(inst.summary)).drawInRect_(
+                     NSMakeRect(SUM_X, ty, WIDTH - SUM_X - PAD, ROW))
+
+        foot = NSMakeRect(PAD + 2, bounds.size.height - FOOT, WIDTH - 2 * PAD, FOOT - 4)
+        if app.error:
+            text(app.error, "#df6565").drawInRect_(foot)
+        elif len(app.rows) > MAX_ROWS:
+            text(f"+{len(app.rows) - MAX_ROWS} more, keep typing", DIM).drawInRect_(foot)
+        text("1-0/enter jump   esc close", DIM, align_right=True).drawInRect_(foot)
+
+    def mouseDown_(self, event):
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        row = int((point.y - (PAD + HEAD)) // ROW)
+        if 0 <= row < min(len(self.app.rows), MAX_ROWS):
+            self.app.jump_row(row)
+
+    def keyDown_(self, event):
+        app = self.app
+        code = event.keyCode()
+        chars = event.characters() or ""
+        if code == 53:                                   # escape
+            app.hide()
+        elif code in (36, 76):                           # return, keypad enter
+            app.jump_row(app.selected_row())
+        elif code == 51:                                 # backspace
+            app.filter = app.filter[:-1]
+            app.refresh()
+        elif code in (125, 126):                         # down, up
+            app.move(1 if code == 125 else -1)
+        elif not app.filter and chars in NUMBERS:
+            # a digit into an *empty* filter picks that row, as in the TUI. Once the
+            # filter has anything in it a digit is just another filter character, and a
+            # leading space is how you search for something that starts with one
+            app.jump_row(NUMBERS.index(chars))
+        elif chars.isprintable():
+            app.filter += chars
+            app.refresh()
+
+
+class Panel(NSPanel):
+    def canBecomeKeyWindow(self):
+        return True          # a borderless panel refuses keys without this
+
+
+# ------------------------------------------------------------------------------ the app
+
+class Systray(NSObject):
+
+    def init(self):
+        self = objc.super(Systray, self).init()
+        self.clock = StateClock()
+        self.instances, self.rows = [], []
+        self.filter = ""
+        self.selected = None       # the pid under the cursor, not the row number
+        self.error = ""
+        self.hidden_at = 0.0
+
+        bar = NSStatusBar.systemStatusBar()
+        self.item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+        self.item.button().setTarget_(self)
+        self.item.button().setAction_(b"toggle:")
+
+        view = ListView.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 100))
+        view.app = self
+        self.view = view
+        self.panel = Panel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, WIDTH, 100), NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered, False)
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setLevel_(3)            # NSFloatingWindowLevel
+        self.panel.setContentView_(view)
+        self.panel.setDelegate_(self)
+
+        self.poll_(None)
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            POLL, self, b"poll:", None, True)
+        return self
+
+    # ---- the listing
+
+    def poll_(self, timer):
+        self.instances = self.clock.update(discover())
+        if self.clock.woke:                # busy -> wait: a turn ended or a prompt is up
+            play()
+        self.refresh()
+
+    @objc.python_method
+    def refresh(self):
+        self.rows = rank(self.instances, self.filter.strip().lower())
+        shown = self.rows[:MAX_ROWS]
+        if not any(i.pid == self.selected for i in shown):
+            self.selected = shown[0].pid if shown else None
+        self.retitle()
+        if self.panel.isVisible():
+            self.layout()
+            self.view.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def retitle(self):
+        """<waiting>/<total>, with the count that wants you in the color that says so."""
+        waiting = sum(i.state == "wait" for i in self.instances)
+        font = NSFont.monospacedDigitSystemFontOfSize_weight_(13, NSFontWeightRegular)
+        title = NSMutableAttributedString.alloc().initWithString_attributes_(
+            f"{waiting}/{len(self.instances)}",
+            {NSFontAttributeName: font,
+             NSForegroundColorAttributeName: NSColor.labelColor()})
+        if waiting:
+            title.addAttribute_value_range_(NSForegroundColorAttributeName,
+                                            rgb("#ffd700"), (0, 1))
+        self.item.button().setAttributedTitle_(title)
+
+    @objc.python_method
+    def match_marks(self, string):
+        found = fuzzy(self.filter.strip().lower(), string) if self.filter.strip() else None
+        return found[1] if found else ()
+
+    # ---- the panel
+
+    @objc.python_method
+    def layout(self):
+        rows = min(max(len(self.rows), 1), MAX_ROWS)
+        height = PAD + HEAD + rows * ROW + FOOT + PAD
+        frame = self.item.button().window().frame()
+        screen = NSScreen.mainScreen().frame()
+        x = min(max(NSMinX(screen) + 8, NSMaxX(frame) - WIDTH), NSMaxX(screen) - WIDTH - 8)
+        self.panel.setFrame_display_(
+            NSMakeRect(x, NSMinY(frame) - height - 6, WIDTH, height), True)
+        self.view.setFrame_(NSMakeRect(0, 0, WIDTH, height))
+
+    @objc.python_method
+    def show(self):
+        self.filter, self.error = "", ""
+        self.refresh()
+        self.layout()
+        # an accessory app has to activate for the panel to take keys at all
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+        self.panel.makeFirstResponder_(self.view)
+
+    @objc.python_method
+    def hide(self):
+        self.hidden_at = time.monotonic()
+        self.panel.orderOut_(None)
+
+    @objc.python_method
+    def toggle(self):
+        """Open the panel, or close it if it is up.
+
+        Clicking the status item makes the status bar key, so the panel resigns and
+        windowDidResignKey_ has already hidden it by the time this runs. Without the
+        moment of memory, that click would read as "it is closed, open it" and the panel
+        would flicker shut and straight back open, which is one of two ways in (the
+        hotkey is the other, and it *does* arrive with the panel still up).
+        """
+        if self.panel.isVisible() or time.monotonic() - self.hidden_at < 0.25:
+            self.hide()
+        else:
+            self.show()
+
+    def toggle_(self, sender):
+        self.toggle()
+
+    def windowDidResignKey_(self, note):
+        self.hide()          # clicking away closes it, like a menu
+
+    # ---- jumping
+
+    @objc.python_method
+    def selected_row(self):
+        return next((n for n, i in enumerate(self.rows) if i.pid == self.selected), 0)
+
+    @objc.python_method
+    def move(self, delta):
+        if not self.rows:
+            return
+        row = min(max(self.selected_row() + delta, 0), min(len(self.rows), MAX_ROWS) - 1)
+        self.selected = self.rows[row].pid
+        self.view.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def jump_row(self, row):
+        if not 0 <= row < len(self.rows):
+            return
+        self.selected = self.rows[row].pid
+        err = jump(self.rows[row])
+        if err:
+            self.error = err
+            self.view.setNeedsDisplay_(True)
+            return
+        self.hide()          # the window moving is the answer; get out of the way
+
+
+def main():
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)   # no dock icon
+    systray = Systray.alloc().init()
+    err = register_hotkey(systray.toggle)   # pressing it again puts it away
+    if err:
+        print(f"RegisterEventHotKey failed: {err}; the menu bar icon still works")
+    if "--show" in sys.argv:
+        # open the panel without the hotkey, which is the only way to look at it from a
+        # script: clicking the status item needs Accessibility, pressing the key needs you
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.3, systray, b"toggle:", None, False)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

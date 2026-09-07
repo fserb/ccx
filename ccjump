@@ -16,7 +16,6 @@ claudes.py, which is stdlib-only and knows nothing about how any of it is drawn.
 
 import contextlib
 import os
-import subprocess
 import sys
 import termios
 
@@ -27,28 +26,9 @@ from textual.containers import Horizontal
 from textual.theme import Theme
 from textual.widgets import DataTable, Rule, Static
 
-from claudes import (ON_EXIT, StateClock, discover, jump, kitty_window_title,
-                     session_records, sh, tmux_window_name)
-
-SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
-PLAYING = []
-
-
-def play(sound=SOUND):
-    """Play a sound and return immediately.
-
-    afplay runs for the length of the file (1.6s for Bottle.aiff) and reload() calls this
-    on the UI thread every 1.5s, so it cannot be waited on. An unwaited child stays a
-    zombie until the process dies, hence the poll of the earlier ones; SIGCHLD cannot be
-    ignored instead, because claudes.sh() uses subprocess.run and needs its own children
-    to be reapable. Missing afplay (not macOS) raises OSError and is simply no sound.
-    """
-    PLAYING[:] = [p for p in PLAYING if p.poll() is None]
-    with contextlib.suppress(OSError):
-        PLAYING.append(subprocess.Popen(["afplay", sound],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL))
-
+from claudes import (ON_EXIT, SORTS, StateClock, discover, fuzzy, jump,
+                     kitty_window_title, play, rank, session_records, sh,
+                     tmux_window_name)
 
 # ----------------------------------------------------------------------------- ui
 
@@ -76,39 +56,12 @@ STATE = {
     "free": ("◌ free", "#626262"),
     "busy": ("◐ busy", "#80c9be"),
 }
-STATE_ORDER = {"wait": 0, "busy": 1, "free": 2}
-SORTS = ("state", "path")
 KEY = "bold #ceaadf"
 KEYS = Text.assemble(("1-0", KEY), "/", ("enter", KEY), " jump   ",
                      ("esc", KEY), " quit   ", ("^s", KEY), " sort")
 
 # the digits label the first ten rows, in the order they are drawn
 NUMBERS = "1234567890"
-
-
-def fuzzy(needle, hay):
-    """Subsequence match. Returns (score, matched indices) or None; lowest score wins.
-
-    Greedy forward to prove the match exists, then greedy backward from the last hit,
-    which pulls the matched characters as far right as they will go and so collapses
-    "ccj" onto the `ccj` in ccjump instead of scattering it over ~/prj/wrangler.
-    Every character skipped costs 2, or 1 when the match lands on a word start, so a
-    match at the head of a path segment beats one buried mid-word."""
-    low = hay.lower()
-    idx, at = [], 0
-    for c in needle:
-        at = low.find(c, at)
-        if at < 0:
-            return None
-        idx.append(at)
-        at += 1
-    for n in range(len(idx) - 2, -1, -1):
-        idx[n] = low.rfind(needle[n], 0, idx[n + 1])
-    score = 0
-    for n, i in enumerate(idx):
-        gap = i - idx[n - 1] - 1 if n else i
-        score += gap * (1 if i == 0 or not hay[i - 1].isalnum() else 2)
-    return score, idx
 
 
 class Table(DataTable):
@@ -188,22 +141,6 @@ class CCJump(App):
         an *empty* filter picks a row instead; " 3" then matches the same as "3"."""
         return self.filter.strip().lower()
 
-    def visible(self):
-        # the ones that want you first, and within a state the one stuck there longest
-        key = ((lambda i: (STATE_ORDER[i.state], i.since)) if self.sort == "state"
-               else (lambda i: (i.short_path, i.pid)))
-        needle = self.needle
-        if not needle:
-            return sorted(self.instances, key=key)
-        scored = []
-        for i in self.instances:
-            hits = [h for h in (fuzzy(needle, i.short_path), fuzzy(needle, i.summary)) if h]
-            if hits:
-                scored.append((min(s for s, _ in hits), i))
-        # a filter outranks the sort: you typed those keys to reach one row, so the
-        # closest match goes on top and enter takes it
-        return [i for _, i in sorted(scored, key=lambda p: (p[0], key(p[1])))]
-
     def mark(self, text, style):
         """Paint the matched characters, so a loose match shows what it matched on."""
         out = Text(text, style=style)
@@ -217,7 +154,7 @@ class CCJump(App):
         # follow the instance under the cursor, not the row number: sorting by state
         # reorders rows as instances change state, and the cursor would drift
         under = self.rows[table.cursor_row].pid if 0 <= table.cursor_row < len(self.rows) else None
-        self.rows = self.visible()
+        self.rows = rank(self.instances, self.needle, self.sort)
         table.clear()
         for n, inst in enumerate(self.rows):
             mark, style = STATE[inst.state]

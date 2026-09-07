@@ -266,6 +266,27 @@ class StateClock:
         return instances
 
 
+# a UI rings this on StateClock.woke; the library itself never makes a sound
+SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
+PLAYING = []
+
+
+def play(sound=SOUND):
+    """Play a sound and return immediately.
+
+    afplay runs for the length of the file (1.6s for Bottle.aiff) and reload() calls this
+    on the UI thread every 1.5s, so it cannot be waited on. An unwaited child stays a
+    zombie until the process dies, hence the poll of the earlier ones; SIGCHLD cannot be
+    ignored instead, because sh() uses subprocess.run and needs its own children
+    to be reapable. Missing afplay (not macOS) raises OSError and is simply no sound.
+    """
+    PLAYING[:] = [p for p in PLAYING if p.poll() is None]
+    with contextlib.suppress(OSError):
+        PLAYING.append(subprocess.Popen(["afplay", sound],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL))
+
+
 IS_CLAUDE = re.compile(r"(^|/)claude(\s|$)|\.claude/local/.*cli\.js")
 PS_LINE = re.compile(r"\s*(\d+)\s+(\d+)\s+(.*)")
 
@@ -421,6 +442,56 @@ def tag_tabs(found):
             continue
         same_window = [p for p in peers if p.window == i.window]
         i.tab = f"{i.window}.{i.pane_index}" if len(same_window) > 1 else i.window
+
+
+# the sort a UI offers, and what "state" means as an order: the ones that want you first,
+# then the ones working, then the empty ones, which are interchangeable
+STATE_ORDER = {"wait": 0, "busy": 1, "free": 2}
+SORTS = ("state", "path")
+
+
+def fuzzy(needle, hay):
+    """Subsequence match. Returns (score, matched indices) or None; lowest score wins.
+
+    Greedy forward to prove the match exists, then greedy backward from the last hit,
+    which pulls the matched characters as far right as they will go and so collapses
+    "ccj" onto the `ccj` in ccjump instead of scattering it over ~/prj/wrangler.
+    Every character skipped costs 2, or 1 when the match lands on a word start, so a
+    match at the head of a path segment beats one buried mid-word."""
+    low = hay.lower()
+    idx, at = [], 0
+    for c in needle:
+        at = low.find(c, at)
+        if at < 0:
+            return None
+        idx.append(at)
+        at += 1
+    for n in range(len(idx) - 2, -1, -1):
+        idx[n] = low.rfind(needle[n], 0, idx[n + 1])
+    score = 0
+    for n, i in enumerate(idx):
+        gap = i - idx[n - 1] - 1 if n else i
+        score += gap * (1 if i == 0 or not hay[i - 1].isalnum() else 2)
+    return score, idx
+
+
+def rank(instances, needle="", sort="state"):
+    """The list in display order, which both UIs want identically.
+
+    Within a state the one stuck there longest goes on top, so the sessions that want you
+    float up. A filter outranks the sort entirely: you typed those keys to reach one row,
+    so the closest match goes first and enter takes it, with the sort breaking ties.
+    """
+    key = ((lambda i: (STATE_ORDER[i.state], i.since)) if sort == "state"
+           else (lambda i: (i.short_path, i.pid)))
+    if not needle:
+        return sorted(instances, key=key)
+    scored = []
+    for i in instances:
+        hits = [h for h in (fuzzy(needle, i.short_path), fuzzy(needle, i.summary)) if h]
+        if hits:
+            scored.append((min(s for s, _ in hits), i))
+    return [i for _, i in sorted(scored, key=lambda p: (p[0], key(p[1])))]
 
 
 # ----------------------------------------------------------------- the jump
