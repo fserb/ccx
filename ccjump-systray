@@ -23,9 +23,15 @@ sunk the design:
 
 Unlike the TUI, jumping closes the panel: this is a launcher you called up to leave, not a
 window you are already sitting in.
+
+    ./ccjump-systray              # starts it and gives the prompt back
+    ./ccjump-systray --foreground # stays attached, for a traceback you can see
+    ./ccjump-systray --show       # opens the panel at launch, to look at it from a script
 """
 
 import ctypes
+import os
+import subprocess
 import sys
 import time
 
@@ -43,7 +49,7 @@ from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
                     NSVariableStatusItemLength, NSView, NSWindowStyleMaskBorderless)
 from Foundation import NSMakeRect, NSMaxX, NSMinX, NSMinY, NSObject
 
-from claudes import StateClock, discover, fuzzy, jump, play, rank
+from claudes import StateClock, discover, fuzzy, jump, play, processes, rank
 
 POLL = 1.5               # same cadence as the TUI, so the bell lands as promptly
 NUMBERS = "1234567890"   # the digits label the first ten rows, in the order drawn
@@ -428,7 +434,53 @@ class Systray(NSObject):
         self.hide()          # the window moving is the answer; get out of the way
 
 
+# --------------------------------------------------------------------------- launching
+
+LOG = "/tmp/ccjump-systray.log"
+PIDFILE = "/tmp/ccjump-systray.pid"
+CHILD = "CCJUMP_SYSTRAY_CHILD"
+
+
+def running_pid():
+    """The pid of an instance already running, or None.
+
+    Two copies means two menu bar items and two bells, which is easy to do by accident now
+    that starting it gives the prompt straight back. The pid in the file could have been
+    reused by anything since, so what it is running is checked too, which also means a
+    stale file needs no cleaning up: the app can be killed in ways that run no exit code.
+    """
+    try:
+        pid = int(open(PIDFILE).read())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    return pid if "ccjump-systray" in processes().get(pid, (0, ""))[1] else None
+
+
+def detach():
+    """Relaunch ourselves in a new session, so closing the terminal does not take the app.
+
+    An exec rather than a bare fork: Cocoa is not fork-safe and AppKit is imported by the
+    time this runs, so a forked child would die on the first CoreFoundation call.
+    start_new_session is setsid(), which is what leaves the app with no controlling
+    terminal, the case claudes.send_kitty()'s tty argument exists for. Output goes to a
+    log, since a detached process with a traceback has nowhere else to put it.
+    """
+    log = open(LOG, "a")
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                             env=os.environ | {CHILD: "1"}, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    print(f"ccjump-systray running as pid {child.pid}  (log: {LOG})")
+
+
 def main():
+    if pid := running_pid():
+        sys.exit(f"ccjump-systray is already running as pid {pid}")
+    if "--foreground" not in sys.argv and not os.environ.get(CHILD):
+        detach()
+        return
+    open(PIDFILE, "w").write(str(os.getpid()))
+
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)   # no dock icon
     systray = Systray.alloc().init()
