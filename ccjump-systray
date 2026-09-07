@@ -37,11 +37,11 @@ import time
 
 import objc
 from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
-                    NSBackingStoreBuffered, NSBezierPath, NSColor,
+                    NSBackingStoreBuffered, NSBezierPath, NSBoldFontMask, NSColor,
                     NSEventMaskLeftMouseDown, NSEventMaskRightMouseDown,
                     NSEventModifierFlagCommand, NSEventModifierFlagControl,
                     NSEventTypeRightMouseDown, NSFont, NSFontAttributeName,
-                    NSFontWeightMedium, NSFontWeightRegular,
+                    NSFontManager, NSFontWeightRegular,
                     NSForegroundColorAttributeName, NSLineBreakByTruncatingHead,
                     NSLineBreakByTruncatingTail, NSMenu, NSMenuItem, NSMutableAttributedString,
                     NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName,
@@ -109,9 +109,9 @@ def register_hotkey(fn):
 # -------------------------------------------------------------------------- the drawing
 
 WIDTH = 620
-ROW = 22                 # one instance
-HEAD = 24                # the filter line
-FOOT = 20                # the key hints
+ROW = 24                 # one instance
+HEAD = 26                # the filter line
+FOOT = 23                # the key hints
 PAD = 8
 MAX_ROWS = 12            # past this the panel is taller than it is useful; keep typing
 
@@ -129,8 +129,10 @@ EDGE = rgb("#35284a")
 ACCENT, MAUVE, DIM, TEXT = "#ceaadf", "#b8a0be", "#626262", "#eeeeee"
 STATE = {"wait": ("● wait", "#ffd700"), "free": ("◌ free", DIM), "busy": ("◐ busy", "#80c9be")}
 
-MONO = NSFont.monospacedSystemFontOfSize_weight_(12, NSFontWeightRegular)
-BOLD = NSFont.monospacedSystemFontOfSize_weight_(12, NSFontWeightMedium)
+FONT, SIZE = "Inconsolata", 16
+MONO = (NSFont.fontWithName_size_(FONT, SIZE)
+        or NSFont.monospacedSystemFontOfSize_weight_(SIZE, NSFontWeightRegular))
+BOLD = NSFontManager.sharedFontManager().convertFont_toHaveTrait_(MONO, NSBoldFontMask)
 
 
 def paragraph(align_right=False, head=False):
