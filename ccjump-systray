@@ -251,10 +251,9 @@ class ListView(NSView):
             text("type to filter", "#4a4a55").drawInRect_(head)
         waiting = sum(i.state == "wait" for i in app.instances)
         count = (f"{len(app.rows)} of {len(app.instances)}" if app.filter
-                 else f"{len(app.instances)} running")
-        if waiting:
-            count += f", {waiting} waiting"
-        text(count, "#ffd700" if waiting else MAUVE, align_right=True).drawInRect_(head)
+                 else f"{waiting}/{len(app.instances)}")
+        text(count, "#ffd700" if waiting and not app.filter else MAUVE,
+             align_right=True).drawInRect_(head)
 
         EDGE.set()
         NSBezierPath.fillRect_(NSMakeRect(0, PAD + HEAD - 5, WIDTH, 1))

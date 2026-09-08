@@ -174,11 +174,10 @@ class CCJump(App):
         self.query_one("#search", Static).update(
             Text(f"/{self.filter}", style="#ceaadf") if self.filter
             else Text("type to filter", style="#4a4a55"))
-        count = (f"{len(self.rows)} of {len(self.instances)} running" if self.filter
-                 else f"{len(self.instances)} running")
+        count = (f"{len(self.rows)} of {len(self.instances)}" if self.filter
+                 else f"{waiting}/{len(self.instances)}")
         self.query_one("#status", Static).update(Text.assemble(
-            (count, "#b8a0be"),
-            ((f", {waiting} waiting", "bold #ffd700") if waiting else ("", "")),
+            (count, "bold #ffd700" if waiting and not self.filter else "#b8a0be"),
             (f"  ·  by {self.sort}", "#b8a0be")))
 
     # a digit typed into an empty filter picks its row; any other printable key filters
