@@ -4,27 +4,36 @@ No UI here: discover() is the listing (path, state, summary, how long it has bee
 that state, and the tmux/kitty coordinates), jump() is the action. Only stdlib, so it
 imports into anything.
 
-Mapping chain, verified on this setup:
+Mapping chain, verified on macOS and on Linux/niri:
 
     claude pid --(walk ppid)--> tmux pane_pid --> session --> client_pid
               --(walk ppid)--> kitty's direct child --> kitty window
+                          --> kitty itself --> the compositor's window id
 
 kitty matches a window only by its *direct* child pid. `zsh -l -c tmux` execs tmux and
 the client is that child, but ktmux (kitty.conf's `shell`) keeps its wrapper zsh alive
 between kitty and the client, so the client pid has to be walked up to the ancestor
 whose parent is kitty before `match pid:N` finds the window.
+
+Almost none of this is per-platform. `ps -axo` takes the same flags either way, and
+kitty's remote control arrives the same way through tmux's passthrough (verified on niri:
+a bare DCS written to another window's client tty renamed that window). Two things do
+differ, and they are the whole of the per-platform code here: what plays the bell, and
+how the terminal window itself gets raised. See PLAYERS and raise_window().
 """
 
 import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 
 HOME = os.path.expanduser("~")
+MAC = sys.platform == "darwin"
 
 # ------------------------------------------------------------------ the listing
 
@@ -52,6 +61,7 @@ class Instance:
     since: float = 0.0       # epoch this instance entered its current state
     client_tty: str = ""
     kitty_pid: str = ""      # kitty's own child above the tmux client; what `pid:` matches
+    kitty_proc: str = ""     # kitty itself; what a Wayland compositor knows the window by
 
     @property
     def match(self):
@@ -266,23 +276,47 @@ class StateClock:
         return instances
 
 
-# a UI rings this on StateClock.woke; the library itself never makes a sound
-SOUND = os.environ.get("CCJUMP_SOUND", "/System/Library/Sounds/Bottle.aiff")
+# a UI rings this on StateClock.woke; the library itself never makes a sound.
+#
+# macOS ships one player under a name that is always there. Linux ships several under
+# names that are not, so the player is whichever of these is installed, in order of how
+# little it does: pw-play and paplay hand the file to the running sound server, ffplay
+# decodes it itself and is the fallback for a box with neither. The default file is the
+# platform's own short chime, Bottle.aiff against freedesktop's complete.oga.
+if MAC:
+    PLAYERS = [["afplay"]]
+    SOUND = "/System/Library/Sounds/Bottle.aiff"
+else:
+    PLAYERS = [["pw-play"], ["paplay"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]]
+    SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+SOUND = os.environ.get("CCJUMP_SOUND", SOUND)
+PLAYER = None            # resolved on the first ring, then reused
 PLAYING = []
+
+
+def bell():
+    """The player argv, resolved once: the first of PLAYERS that is installed, or []."""
+    global PLAYER
+    if PLAYER is None:
+        PLAYER = next((p for p in PLAYERS if shutil.which(p[0])), [])
+    return PLAYER
 
 
 def play(sound=SOUND):
     """Play a sound and return immediately.
 
-    afplay runs for the length of the file (1.6s for Bottle.aiff) and reload() calls this
-    on the UI thread every 1.5s, so it cannot be waited on. An unwaited child stays a
-    zombie until the process dies, hence the poll of the earlier ones; SIGCHLD cannot be
-    ignored instead, because sh() uses subprocess.run and needs its own children
-    to be reapable. Missing afplay (not macOS) raises OSError and is simply no sound.
+    The player runs for the length of the file (1.6s for Bottle.aiff, 1.2s for
+    complete.oga) and reload() calls this on the UI thread every 1.5s, so it cannot be
+    waited on. An unwaited child stays a zombie until the process dies, hence the poll of
+    the earlier ones; SIGCHLD cannot be ignored instead, because sh() uses subprocess.run
+    and needs its own children to be reapable. No player installed, or a sound file that
+    is not there, is simply no sound.
     """
     PLAYING[:] = [p for p in PLAYING if p.poll() is None]
+    if not (cmd := bell()):
+        return
     with contextlib.suppress(OSError):
-        PLAYING.append(subprocess.Popen(["afplay", sound],
+        PLAYING.append(subprocess.Popen([*cmd, sound],
                                         stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL))
 
@@ -299,25 +333,29 @@ def processes():
     return table
 
 
-def kitty_child(pid, procs):
-    """The ancestor of a tmux client that `match pid:` will actually find.
+def kitty_owner(pid, procs):
+    """(the ancestor of a tmux client `match pid:` will find, kitty's own pid).
 
     kitty matches a window only by its *direct* child pid. `zsh -l -c tmux` execs tmux
     and the client is that child, but under ktmux (kitty.conf's `shell`) the wrapper zsh
     stays alive between kitty and the client, and `pid:<client_pid>` matched nothing,
     silently: the jump switched panes and moved no window, for every window ktmux had
-    opened. A client with no kitty ancestor (ssh, another terminal) comes back unchanged,
-    which fails the same way it always did.
+    opened. So walk up until the parent is kitty rather than assuming either shape; the
+    Linux setup runs the same kitty.conf and there the client *is* the direct child.
+
+    The second value is kitty itself, which raise_window() needs on Wayland and nothing
+    needs on macOS. A client with no kitty ancestor (ssh, another terminal) comes back
+    unchanged and with 0, which fails the same way it always did.
     """
     cur = pid
     for _ in range(12):
         ppid, _ = procs.get(cur, (0, ""))
         if ppid not in procs:
-            return pid
+            break
         if procs[ppid][1].split(" ")[0].rpartition("/")[2] == "kitty":
-            return cur
+            return cur, ppid
         cur = ppid
-    return pid
+    return pid, 0
 
 
 def tmux_rows(subcommand, fields, *extra):
@@ -409,6 +447,7 @@ def discover():
             continue
         client = client_by_session.get(pane["session_name"], {})
         cpid = client.get("client_pid", "")
+        child, kitty = kitty_owner(int(cpid), procs) if cpid else (0, 0)
         found.append(Instance(
             pid=pid,
             pane=pane["pane_id"],
@@ -424,7 +463,8 @@ def discover():
             status_since=since,
             last_write=0 if state else last_write(pane["pane_current_path"]),
             client_tty=client.get("client_tty", ""),
-            kitty_pid=str(kitty_child(int(cpid), procs)) if cpid else "",
+            kitty_pid=str(child) if cpid else "",
+            kitty_proc=str(kitty) if kitty else "",
         ))
     tag_tabs(found)
     return sorted(found, key=lambda i: (i.short_path, i.pid))
@@ -535,6 +575,51 @@ def send_kitty(command, payload, tty=None):
         return False
 
 
+def niri_window(pid):
+    """The niri window id for a process, or None. niri is the compositor on this box.
+
+    A kitty process here owns exactly one OS window, so its pid identifies the window;
+    `single_instance` or `kitty @ launch --type=os-window` would break that and this
+    would raise whichever of them niri lists first. Nothing else on Wayland can do
+    better without kitty telling us which of its windows is where, which it cannot.
+    """
+    with contextlib.suppress(ValueError):
+        for w in json.loads(sh("niri", "msg", "--json", "windows") or "[]"):
+            if str(w.get("pid")) == str(pid):
+                return w.get("id")
+    return None
+
+
+def raise_window(inst):
+    """Bring the terminal's own window to the front. The per-platform half of the jump.
+
+    macOS: `open -a kitty` activates the application, and send_kitty("focus-window")
+    above has already decided which of its windows that means.
+
+    Wayland: an app can only raise itself with an activation token handed to it from a
+    recent interaction, which a poll loop and a menu bar click do not have, so kitty's
+    focus-window moves the tab inside a window and leaves the window where it is
+    (verified on niri: focus-window to two different windows in turn, and the focused
+    window did not change either time). The compositor has to be asked directly, by its
+    own id for the window, which niri_window() looks up from kitty's pid. That also
+    switches to the workspace the window is on, which macOS gets from `open`.
+    """
+    if MAC:
+        sh("open", "-a", "kitty")
+    elif inst.kitty_proc and (wid := niri_window(inst.kitty_proc)) is not None:
+        sh("niri", "msg", "action", "focus-window", "--id", str(wid))
+
+
+def raise_target(inst):
+    """What raise_window() would do with this instance, for `ccjump doctor` to print."""
+    if MAC:
+        return "open -a kitty"
+    if not inst.kitty_proc:
+        return "(no kitty ancestor)"
+    wid = niri_window(inst.kitty_proc)
+    return f"niri {wid}" if wid is not None else f"(kitty {inst.kitty_proc} not in niri)"
+
+
 def jump(inst):
     """Focus the instance. Returns an error message, or None when it worked."""
     if not inst.pane:
@@ -548,8 +633,7 @@ def jump(inst):
     if inst.match:
         # the client's own tty, so this works with no controlling terminal of our own
         send_kitty("focus-window", {"match": inst.match}, tty=inst.client_tty or None)
-    if sys.platform == "darwin":
-        sh("open", "-a", "kitty")
+    raise_window(inst)
     return None
 
 
@@ -611,7 +695,7 @@ def kitty_window_title(name):
         if not pid:                          # no client attached, so no window to name
             yield
             return
-        target = {"match": f"pid:{kitty_child(int(pid), processes())}"}
+        target = {"match": f"pid:{kitty_owner(int(pid), processes())[0]}"}
     send_kitty("set-window-title", target | {"title": name})
 
     def restore():
