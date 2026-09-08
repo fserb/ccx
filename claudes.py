@@ -281,15 +281,20 @@ class StateClock:
 # macOS ships one player under a name that is always there. Linux ships several under
 # names that are not, so the player is whichever of these is installed, in order of how
 # little it does: pw-play and paplay hand the file to the running sound server, ffplay
-# decodes it itself and is the fallback for a box with neither. The default file is the
-# platform's own short chime, Bottle.aiff against freedesktop's complete.oga.
+# decodes it itself and is the fallback for a box with neither.
+#
+# The file ships with the repo, so the bell is the same sound on both platforms and does
+# not depend on what the box happens to have installed: freedesktop's complete.oga is a
+# sound-theme package, not part of a base install. It is a copy of macOS's
+# /System/Library/Sounds/Bottle.aiff (0.77s, 24-bit 48kHz stereo). All three Linux
+# players read AIFF: pw-play and paplay decode through libsndfile, ffplay through
+# ffmpeg.
 if MAC:
     PLAYERS = [["afplay"]]
-    SOUND = "/System/Library/Sounds/Bottle.aiff"
 else:
     PLAYERS = [["pw-play"], ["paplay"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]]
-    SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
-SOUND = os.environ.get("CCJUMP_SOUND", SOUND)
+SOUND = os.environ.get(
+    "CCJUMP_SOUND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bottle.aiff"))
 PLAYER = None            # resolved on the first ring, then reused
 PLAYING = []
 
@@ -305,8 +310,8 @@ def bell():
 def play(sound=SOUND):
     """Play a sound and return immediately.
 
-    The player runs for the length of the file (1.6s for Bottle.aiff, 1.2s for
-    complete.oga) and reload() calls this on the UI thread every 1.5s, so it cannot be
+    The player runs for the length of the file (1.6s for afplay: 0.8s of sound plus
+    startup) and reload() calls this on the UI thread every 1.5s, so it cannot be
     waited on. An unwaited child stays a zombie until the process dies, hence the poll of
     the earlier ones; SIGCHLD cannot be ignored instead, because sh() uses subprocess.run
     and needs its own children to be reapable. No player installed, or a sound file that
