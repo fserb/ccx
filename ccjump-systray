@@ -163,7 +163,7 @@ def text(string, color, font=MONO, hits=(), **kw):
 
 ICON = 18                # square, inside the menu bar's 22pt, with room to breathe
 MIN_GRID = 2             # 2x2 is the smallest; one dot filling the icon is a blob
-DOTS = {"wait": rgb("#ffd700"), "busy": rgb("#80c9be")}   # free is labelColor, below
+DOTS = {"wait": rgb("#ffd700"), "busy": rgb("#e9e9e9")}   # free is labelColor, below
 
 
 def icon(states):
@@ -173,18 +173,36 @@ def icon(states):
     the count and the colors are what those sessions are doing. 2x2 is the floor: the box
     is a fixed 18pt whatever the grid, so a lone instance in a 1x1 draws one 11pt ball.
 
+    What is centered in the box is the dots, not the grid: the rows that have anything in
+    them are centered vertically and each row is centered in itself, so two draw a centered
+    pair, three a pair with one dot under the middle of it, five a row of three over a
+    centered pair, and one lone dot sits dead center. The cost is that a dot moves as
+    sessions come and go, since the same cell is a different place once the row changes
+    width. The alternative was a fixed cell per dot, which parks the whole icon in the
+    upper-left corner of the item whenever the grid is not full.
+
     Rank order fills the grid, which puts every gold `wait` dot first: the icon is for
     telling you at a glance that something wants you, and reading an exact number off the
     menu bar was never the point.
 
-    `free` is drawn in labelColor rather than the panel's #626262, which would be black on
-    a black menu bar. That is also why the drawing is a handler and not a finished bitmap:
+    `busy` and `free` are not the panel's colors: the panel has its own near-black behind
+    it, the menu bar has the desktop, and #626262 on a dark one is nearly invisible, so
+    free is labelColor. That is also why the drawing is a handler and not a finished bitmap:
     AppKit re-runs it whenever the image is drawn, so the dynamic color follows a switch to
     light mode without us noticing the switch.
     """
     grid = max(MIN_GRID, math.ceil(math.sqrt(len(states))))
     cell = ICON / grid
     size = cell * 0.62
+    count = max(len(states), 1)             # the empty ring lays out as a single dot
+    top = (ICON - math.ceil(count / grid) * cell) / 2
+
+    def spot(n):
+        """Dot n's rect: the filled rows centered in the box, each row centered in itself."""
+        row, col = divmod(n, grid)
+        left = (ICON - min(count - row * grid, grid) * cell) / 2
+        return NSMakeRect(left + col * cell + (cell - size) / 2,
+                          ICON - top - (row + 1) * cell + (cell - size) / 2, size, size)
 
     def draw(rect):
         for n, state in enumerate(states):
@@ -192,13 +210,9 @@ def icon(states):
                 DOTS[state].set()
             else:
                 NSColor.labelColor().colorWithAlphaComponent_(0.45).set()
-            col, row = n % grid, n // grid
-            NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(
-                col * cell + (cell - size) / 2,
-                ICON - (row + 1) * cell + (cell - size) / 2, size, size)).fill()
+            NSBezierPath.bezierPathWithOvalInRect_(spot(n)).fill()
         if not states:      # nothing running still needs something to click on
-            ring = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(
-                (cell - size) / 2, ICON - cell + (cell - size) / 2, size, size))
+            ring = NSBezierPath.bezierPathWithOvalInRect_(spot(0))
             ring.setLineWidth_(1.2)
             NSColor.labelColor().colorWithAlphaComponent_(0.35).set()
             ring.stroke()
