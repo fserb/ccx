@@ -176,8 +176,14 @@ class Model:
     # ---- the cursor and the jump
 
     def opened(self):
-        """Called every time the panel comes up: a fresh filter and no stale error."""
-        self.filter, self.error = "", ""
+        """Called every time the panel comes up: a fresh filter, no stale error, and the
+        cursor back on the top row.
+
+        Dropping `selected` is what puts it there: `refresh` only moves the cursor when
+        the pid under it is gone, so without this the panel comes up on whatever row you
+        left it on, which is the wrong row now that the ranking has been redone.
+        """
+        self.filter, self.error, self.selected = "", "", None
         self.refresh()
 
     def selected_row(self):
