@@ -53,13 +53,15 @@ def icon_dots(count, box=ICON):
     the colors are what those sessions are doing. 2x2 is the floor: the box is a fixed
     size whatever the grid, so a lone instance in a 1x1 would draw one huge ball.
 
-    What is centered in the box is the dots, not the grid: the rows that have anything in
-    them are centered vertically and each row is centered in itself, so two draw a
-    centered pair, three a pair with one dot under the middle of it, five a row of three
-    over a centered pair, and one lone dot sits dead center. The cost is that a dot moves
-    as sessions come and go, since the same cell is a different place once the row changes
-    width. The alternative was a fixed cell per dot, which parks the whole icon in a
-    corner of the item whenever the grid is not full.
+    What is centered in the box is the block of cells the dots use, not the whole grid and
+    not each row on its own: the cells stay on one lattice, and the rows that have
+    anything in them are centered as one rectangle. One dot sits dead center, two are a
+    centered pair, three are a 2x2 with the last cell empty, five a row of three over the
+    first two cells of the next row. Centering each row in itself instead would put the
+    third dot under the middle of the pair, which reads as a triangle rather than as a
+    grid with a hole. The cost is that a dot moves as sessions come and go, since the
+    block changes size; the alternative was a fixed cell per dot, which parks the whole
+    icon in a corner of the item whenever the grid is not full.
 
     A count of zero still gets one spot: nothing running needs something to click on, and
     the backends draw that one as an empty ring.
@@ -72,10 +74,10 @@ def icon_dots(count, box=ICON):
     cell = box / grid
     radius = cell * 0.62 / 2
     top = (box - math.ceil(shown / grid) * cell) / 2
+    left = (box - min(shown, grid) * cell) / 2
     spots = []
     for n in range(shown):
         row, col = divmod(n, grid)
-        left = (box - min(shown - row * grid, grid) * cell) / 2
         spots.append((left + col * cell + cell / 2, top + row * cell + cell / 2, radius))
     return spots
 
