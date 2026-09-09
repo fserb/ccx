@@ -138,9 +138,11 @@ def rounded(cr, x, y, w, h, r):
 # pure red, green and blue dots it handed back dark, mid and darkest grey, in luminance
 # order, so hue carries nothing and luminance carries everything. Hence wait is the
 # brightest thing in the icon and free the faintest; the gold is still gold for anyone
-# whose bar leaves icons alone.
-DOTS = {"wait": (GOLD, 1.0), "busy": ("#e9e9e9", 0.55)}
-FREE = ("#e9e9e9", 0.24)
+# whose bar leaves icons alone. The wait dot is also drawn wider than the rest (see
+# icon_dots), which is the one signal a tint mode cannot take away: a bar that flattens
+# every dot to one color still shows a bigger one where something wants you.
+DOTS = {"wait": (GOLD, 1.0), "busy": ("#c8c8c8", 0.55)}
+FREE = ("#c8c8c8", 0.24)
 SIZES = (22, 44)         # the host picks whichever fits its bar; 44 covers a 2x scale
 
 
@@ -155,7 +157,7 @@ def pixmap(states, px):
     """
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, px, px)
     cr = cairo.Context(surf)
-    spots = icon_dots(len(states), px)
+    spots = icon_dots(states, px)
     for state, (cx, cy, r) in zip(states, spots):
         cr.set_source_rgba(*rgba(*DOTS.get(state, FREE)))
         cr.arc(cx, cy, r, 0, 2 * math.pi)

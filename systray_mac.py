@@ -127,13 +127,14 @@ def text(string, color, font=MONO, hits=(), **kw):
 # it, the menu bar has the desktop, and #626262 on a dark one is nearly invisible, so free
 # is labelColor. That is also why the drawing is a handler and not a finished bitmap:
 # AppKit re-runs it whenever the image is drawn, so the dynamic color follows a switch to
-# light mode without us noticing the switch.
-DOTS = {"wait": rgb(GOLD), "busy": rgb("#e9e9e9")}   # free is labelColor, below
+# light mode without us noticing the switch. #c8c8c8 sits under the gold's luminance the
+# same way the panel's busy does, so the one dot that wants you is the brightest one.
+DOTS = {"wait": rgb(GOLD), "busy": rgb("#c8c8c8")}   # free is labelColor, below
 
 
 def icon(states):
     """The menu bar image: one dot per instance, laid out by systray.icon_dots()."""
-    spots = icon_dots(len(states))
+    spots = icon_dots(states)
 
     def rect(spot):
         cx, cy, r = spot                    # cy comes down from the top, this view's is up

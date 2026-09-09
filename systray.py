@@ -22,10 +22,10 @@ NUMBERS = "1234567890"   # the digits label the first ten rows, in the order dra
 # ------------------------------------------------------------------------- the look
 
 # the TUI's palette, out of ~/.config/kitty/kitty.conf, so the tools look like one
-ACCENT, MAUVE, DIM, TEXT = "#ceaadf", "#b8a0be", "#626262", "#eeeeee"
+ACCENT, MAUVE, DIM, TEXT = "#ceaadf", "#b8a0be", "#626262", "#d6d6dc"
 BG, EDGE, CURSOR = "#0e0b12", "#35284a", "#2a1e38"
-GOLD, IDLE, HINT, ERROR = "#ffd700", "#9a9aa0", "#4a4a55", "#df6565"
-STATE = {"wait": ("● wait", GOLD), "free": ("◌ free", DIM), "busy": ("◐ busy", "#80c9be")}
+GOLD, IDLE, HINT, ERROR = "#ffd500", "#82828a", "#4a4a55", "#df6565"
+STATE = {"wait": ("● wait", GOLD), "free": ("◌ free", DIM), "busy": ("◐ busy", "#93aeaa")}
 
 # one point on macOS and one logical pixel on Wayland are close enough to the same size
 # that both panels lay out on these, so a row is a row and the columns line up either way
@@ -43,10 +43,12 @@ HINTS = "1-0/enter jump   esc close"
 
 ICON = 18                # square, inside the menu bar's 22pt, with room to breathe
 MIN_GRID = 2             # 2x2 is the smallest; one dot filling the icon is a blob
+FILL = 0.62              # how much of its cell a dot takes across
+WAIT_FILL = 0.80         # except a `wait` dot, which is bigger so it is the one you see
 
 
-def icon_dots(count, box=ICON):
-    """Where `count` dots go in a `box`-sized square, as (cx, cy, r), cy from the top.
+def icon_dots(states, box=ICON):
+    """Where a dot per state goes in a `box`-sized square, as (cx, cy, r), cy from the top.
 
     One dot per instance, in the smallest square grid that holds them all. Three instances
     make a 2x2 with a hole in it, five a 3x3, so the shape of the icon is the count and
@@ -63,22 +65,29 @@ def icon_dots(count, box=ICON):
     block changes size; the alternative was a fixed cell per dot, which parks the whole
     icon in a corner of the item whenever the grid is not full.
 
-    A count of zero still gets one spot: nothing running needs something to click on, and
+    A `wait` dot is drawn at 80% of its cell against everyone else's 62%, so it is bigger
+    as well as brighter and the icon answers "does something want me" from the corner of
+    an eye. As a fraction of the cell rather than a fixed bump, that is +0.81pt across a
+    2x2 and +0.54 across a 3x3, and it can never grow into the dot beside it. It is the
+    only reason this needs the states and not just how many there are.
+
+    No states at all still gets one spot: nothing running needs something to click on, and
     the backends draw that one as an empty ring.
 
     cy grows downward, which is cairo's convention and the reverse of an unflipped
     AppKit view, so systray_mac flips it back.
     """
-    shown = max(count, 1)
+    shown = max(len(states), 1)
     grid = max(MIN_GRID, math.ceil(math.sqrt(shown)))
     cell = box / grid
-    radius = cell * 0.62 / 2
     top = (box - math.ceil(shown / grid) * cell) / 2
     left = (box - min(shown, grid) * cell) / 2
     spots = []
     for n in range(shown):
         row, col = divmod(n, grid)
-        spots.append((left + col * cell + cell / 2, top + row * cell + cell / 2, radius))
+        fill = WAIT_FILL if n < len(states) and states[n] == "wait" else FILL
+        spots.append((left + col * cell + cell / 2, top + row * cell + cell / 2,
+                      cell * fill / 2))
     return spots
 
 

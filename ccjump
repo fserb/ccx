@@ -39,7 +39,7 @@ PURPLE = Theme(
     primary="#ceaadf",
     secondary="#b8a0be",
     accent="#ceaadf",
-    foreground="#eeeeee",
+    foreground="#d6d6dc",
     background="#000000",
     surface="#0e0b12",
     panel="#181020",
@@ -49,12 +49,19 @@ PURPLE = Theme(
     dark=True,
 )
 
-# #ffd700 is xterm 220, the exact color Claude Code paints "⏵⏵ auto mode on" with
-# (read off a live pane as `ESC[38;5;220m`), so the two agree on what wants you
+# gold is the brightest thing on the screen and nothing else is allowed above it, which
+# is what makes a `wait` row findable without reading it. It started as #ffd700, xterm 220,
+# the exact color Claude Code paints "⏵⏵ auto mode on" with (read off a live pane as
+# `ESC[38;5;220m`); #ffd500 is a shade deeper and still reads as the same yellow. Every
+# other color is under it by relative luminance: gold .69, the `wait` summary .68, busy
+# .39, every other summary .23. The old #eeeeee summary was .86, brighter than the gold it
+# sat next to, so the row that wanted you was not the loudest one in it. Busy keeps a
+# trace of its old teal rather than going flat grey, since at .39 that hue is the only
+# thing telling its label from the greys at a glance
 STATE = {
-    "wait": ("● wait", "#ffd700"),
+    "wait": ("● wait", "#ffd500"),
     "free": ("◌ free", "#626262"),
-    "busy": ("◐ busy", "#80c9be"),
+    "busy": ("◐ busy", "#93aeaa"),
 }
 KEY = "bold #ceaadf"
 KEYS = Text.assemble(("1-0", KEY), "/", ("enter", KEY), " jump   ",
@@ -163,7 +170,7 @@ class CCJump(App):
                 Text(mark, style=style),
                 Text(inst.age, style="#626262"),
                 self.mark(inst.short_path, "#b8a0be"),
-                self.mark(inst.summary, "#eeeeee" if inst.state == "wait" else "#9a9aa0"),
+                self.mark(inst.summary, "#d6d6dc" if inst.state == "wait" else "#82828a"),
             )
         if self.rows:
             keep = next((n for n, i in enumerate(self.rows) if i.pid == under), None)
@@ -177,7 +184,7 @@ class CCJump(App):
         count = (f"{len(self.rows)} of {len(self.instances)}" if self.filter
                  else f"{waiting}/{len(self.instances)}")
         self.query_one("#status", Static).update(Text.assemble(
-            (count, "bold #ffd700" if waiting and not self.filter else "#b8a0be"),
+            (count, "bold #ffd500" if waiting and not self.filter else "#b8a0be"),
             (f"  ·  by {self.sort}", "#b8a0be")))
 
     # a digit typed into an empty filter picks its row; any other printable key filters
