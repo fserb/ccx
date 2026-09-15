@@ -367,7 +367,7 @@ class Systray(NSObject):
         """
         menu = NSMenu.alloc().init()
         menu.addItemWithTitle_action_keyEquivalent_(
-            f"ccjump-systray  ·  {HOTKEY_NAME}", None, "").setEnabled_(False)
+            f"ccx-systray  ·  {HOTKEY_NAME}", None, "").setEnabled_(False)
         menu.addItem_(NSMenuItem.separatorItem())
         quit_item = menu.addItemWithTitle_action_keyEquivalent_("Quit", b"terminate:", "q")
         quit_item.setTarget_(NSApplication.sharedApplication())

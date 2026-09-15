@@ -8,10 +8,10 @@
 The UI and the CLI that dispatches it. The listing and the jump itself live in
 claudes.py, which is stdlib-only and knows nothing about how any of it is drawn.
 
-    ./ccjump              # the TUI
-    ./ccjump list         # plain listing
-    ./ccjump doctor       # what resolves, and the kitty match it would use
-    ./ccjump focus <pid>  # jump without the UI
+    ./ccx              # the TUI
+    ./ccx list         # plain listing
+    ./ccx doctor       # what resolves, and the kitty match it would use
+    ./ccx focus <pid>  # jump without the UI
 """
 
 import contextlib
@@ -35,7 +35,7 @@ from claudes import (ON_EXIT, SORTS, SOUND, StateClock, bell, discover, fuzzy,
 # Built from ~/.config/kitty/kitty.conf so the app matches the terminal it runs in:
 # color13 #ceaadf (bright purple), color5 #b8a0be (mauve), background #000.
 PURPLE = Theme(
-    name="ccjump",
+    name="ccx",
     primary="#ceaadf",
     secondary="#b8a0be",
     accent="#ceaadf",
@@ -82,7 +82,7 @@ class Table(DataTable):
             self.action_select_cursor()
 
 
-class CCJump(App):
+class CCX(App):
     CSS = """
     Screen { background: $background; }
     #bar { height: 1; background: $panel; }
@@ -125,7 +125,7 @@ class CCJump(App):
 
     def on_mount(self):
         self.register_theme(PURPLE)
-        self.theme = "ccjump"
+        self.theme = "ccx"
         table = self.query_one(Table)
         table.add_column("", width=1)          # the digit that jumps to the row
         table.add_column("state", width=6)
@@ -263,8 +263,8 @@ class CCJump(App):
 # ---------------------------------------------------------------------------- cli
 
 def cmd_ui():
-    with tmux_window_name("ccjump"), kitty_window_title("ccjump"):
-        CCJump().run()
+    with tmux_window_name("ccx"), kitty_window_title("ccx"):
+        CCX().run()
 
 
 def cmd_list():
@@ -302,5 +302,5 @@ COMMANDS = {"ui": cmd_ui, "list": cmd_list, "doctor": cmd_doctor, "focus": cmd_f
 if __name__ == "__main__":
     name, *rest = sys.argv[1:] or ["ui"]
     if name not in COMMANDS:
-        sys.exit(f"usage: ccjump [{' | '.join(COMMANDS)}]")
+        sys.exit(f"usage: ccx [{' | '.join(COMMANDS)}]")
     COMMANDS[name](*rest)

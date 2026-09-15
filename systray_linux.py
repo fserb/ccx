@@ -17,10 +17,10 @@ of them could have sunk the design:
 
 There is no global hotkey: on Wayland the compositor owns the keyboard, and an
 application cannot ask for a shortcut. So the hotkey is a niri bind that runs
-`ccjump-systray --toggle`, which sends SIGUSR1 to the running one. Add to niri's config:
+`ccx-systray --toggle`, which sends SIGUSR1 to the running one. Add to niri's config:
 
-    Mod+J repeat=false hotkey-overlay-title="ccjump" {
-        spawn "/home/fserb/prj/ccjump/ccjump-systray" "--toggle";
+    Mod+J repeat=false hotkey-overlay-title="ccx" {
+        spawn "/home/fserb/prj/ccx/ccx-systray" "--toggle";
     }
 """
 
@@ -260,7 +260,7 @@ class Tray:
         if name == "Category":
             return GLib.Variant("s", "ApplicationStatus")
         if name in ("Id", "Title"):
-            return GLib.Variant("s", "ccjump")
+            return GLib.Variant("s", "ccx")
         if name == "Status":
             return GLib.Variant("s", "Active")
         if name in ("IconName", "OverlayIconName", "AttentionIconName"):
@@ -268,7 +268,7 @@ class Tray:
         if name == "IconPixmap":
             return GLib.Variant("a(iiay)", [pixmap(self.states, px) for px in SIZES])
         if name == "ToolTip":
-            return GLib.Variant("(sa(iiay)ss)", ("", [], "ccjump", self.tip))
+            return GLib.Variant("(sa(iiay)ss)", ("", [], "ccx", self.tip))
         if name == "ItemIsMenu":
             return GLib.Variant("b", False)   # we answer clicks; there is no menu
         if name == "Menu":

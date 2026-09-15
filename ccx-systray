@@ -18,17 +18,17 @@ and each platform's own drawing is behind it in systray_mac.py or systray_linux.
 Unlike the TUI, jumping closes the panel: this is a launcher you called up to leave, not a
 window you are already sitting in.
 
-    ./ccjump-systray              # starts it and gives the prompt back
-    ./ccjump-systray --foreground # stays attached, for a traceback you can see
-    ./ccjump-systray --show       # opens the panel at launch, to look at it from a script
-    ./ccjump-systray --toggle     # opens or closes the running one (Linux; see below)
+    ./ccx-systray              # starts it and gives the prompt back
+    ./ccx-systray --foreground # stays attached, for a traceback you can see
+    ./ccx-systray --show       # opens the panel at launch, to look at it from a script
+    ./ccx-systray --toggle     # opens or closes the running one (Linux; see below)
 
 macOS has a global hotkey of its own, ^⌥⌘J, registered with Carbon. Wayland has no such
 thing: the compositor owns the keyboard and an application cannot ask it for a shortcut,
 so on Linux the hotkey is a niri bind that runs `--toggle`:
 
-    Mod+J repeat=false hotkey-overlay-title="ccjump" {
-        spawn "/home/fserb/prj/ccjump/ccjump-systray" "--toggle";
+    Mod+J repeat=false hotkey-overlay-title="ccx" {
+        spawn "/home/fserb/prj/ccx/ccx-systray" "--toggle";
     }
 """
 
@@ -39,9 +39,9 @@ import sys
 
 from claudes import MAC, processes
 
-LOG = "/tmp/ccjump-systray.log"
-PIDFILE = "/tmp/ccjump-systray.pid"
-CHILD = "CCJUMP_SYSTRAY_CHILD"
+LOG = "/tmp/ccx-systray.log"
+PIDFILE = "/tmp/ccx-systray.pid"
+CHILD = "CCX_SYSTRAY_CHILD"
 
 
 def running_pid():
@@ -57,7 +57,7 @@ def running_pid():
         os.kill(pid, 0)
     except (OSError, ValueError):
         return None
-    return pid if "ccjump-systray" in processes().get(pid, (0, ""))[1] else None
+    return pid if "ccx-systray" in processes().get(pid, (0, ""))[1] else None
 
 
 def detach():
@@ -73,7 +73,7 @@ def detach():
     child = subprocess.Popen([sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
                              env=os.environ | {CHILD: "1"}, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log)
-    print(f"ccjump-systray running as pid {child.pid}  (log: {LOG})")
+    print(f"ccx-systray running as pid {child.pid}  (log: {LOG})")
 
 
 def toggle():
@@ -87,7 +87,7 @@ def toggle():
     if MAC:
         sys.exit("--toggle is for Linux; on macOS press the hotkey, ^⌥⌘J")
     if not (pid := running_pid()):
-        sys.exit("ccjump-systray is not running")
+        sys.exit("ccx-systray is not running")
     os.kill(pid, signal.SIGUSR1)
 
 
@@ -96,7 +96,7 @@ def main():
         toggle()
         return
     if pid := running_pid():
-        sys.exit(f"ccjump-systray is already running as pid {pid}")
+        sys.exit(f"ccx-systray is already running as pid {pid}")
     if "--foreground" not in sys.argv and not os.environ.get(CHILD):
         detach()
         return

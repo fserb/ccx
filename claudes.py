@@ -294,7 +294,7 @@ if MAC:
 else:
     PLAYERS = [["pw-play"], ["paplay"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]]
 SOUND = os.environ.get(
-    "CCJUMP_SOUND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bottle.aiff"))
+    "CCX_SOUND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bottle.aiff"))
 PLAYER = None            # resolved on the first ring, then reused
 PLAYING = []
 
@@ -500,7 +500,7 @@ def fuzzy(needle, hay):
 
     Greedy forward to prove the match exists, then greedy backward from the last hit,
     which pulls the matched characters as far right as they will go and so collapses
-    "ccj" onto the `ccj` in ccjump instead of scattering it over ~/prj/wrangler.
+    "cx" onto the trailing `cx` of ~/prj/ccx instead of taking the c before it.
     Every character skipped costs 2, or 1 when the match lands on a word start, so a
     match at the head of a path segment beats one buried mid-word."""
     low = hay.lower()
@@ -616,7 +616,7 @@ def raise_window(inst):
 
 
 def raise_target(inst):
-    """What raise_window() would do with this instance, for `ccjump doctor` to print."""
+    """What raise_window() would do with this instance, for `ccx doctor` to print."""
     if MAC:
         return "open -a kitty"
     if not inst.kitty_proc:
