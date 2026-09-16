@@ -1,306 +1,586 @@
-#!/usr/bin/env -S uv run --script --quiet
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["textual"]
-# ///
-"""Pick a running Claude Code instance and focus its kitty window + tmux pane.
+#!/usr/bin/env -S deno run -A
 
-The UI and the CLI that dispatches it. The listing and the jump itself live in
-claudes.py, which is stdlib-only and knows nothing about how any of it is drawn.
+import {
+  discover, fuzzy, jump, kittyWindowTitle, loadBell, NUMBERS, ON_EXIT, PALETTE, play,
+  raiseTarget, rank, ringer, sessionRecords, sh, soundBytes, SORTS, STATE, StateClock,
+  tmuxWindowName,
+} from "./claudes.js";
 
-    ./ccx              # the TUI
-    ./ccx list         # plain listing
-    ./ccx doctor       # what resolves, and the kitty match it would use
-    ./ccx focus <pid>  # jump without the UI
-"""
+// --------------------------------------------------------------------------- render
 
-import contextlib
-import os
-import sys
-import termios
+const ESC = "\x1b";
+const RESET = `${ESC}[0m`;
+const BOLD = `${ESC}[1m`;
+// built, not written as a literal: the ESC byte inside a regex literal is what `deno lint`'s
+// no-control-regex is about, and the byte is the point here
+const SGR = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
 
-from rich.text import Text
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.theme import Theme
-from textual.widgets import DataTable, Rule, Static
-
-from claudes import (ON_EXIT, SORTS, StateClock, discover, fuzzy, jump,
-                     kitty_window_title, play, rank, raise_target, ringer,
-                     session_records, sh, sound, tmux_window_name)
-
-# ----------------------------------------------------------------------------- ui
-
-# Built from ~/.config/kitty/kitty.conf so the app matches the terminal it runs in:
-# color13 #ceaadf (bright purple), color5 #b8a0be (mauve), background #000.
-PURPLE = Theme(
-    name="ccx",
-    primary="#ceaadf",
-    secondary="#b8a0be",
-    accent="#ceaadf",
-    foreground="#d6d6dc",
-    background="#000000",
-    surface="#0e0b12",
-    panel="#181020",
-    warning="#eccd58",
-    error="#df6565",
-    success="#c4d15b",
-    dark=True,
-)
-
-# gold is the brightest thing on the screen and nothing else is allowed above it, which
-# is what makes a `wait` row findable without reading it. It started as #ffd700, xterm 220,
-# the exact color Claude Code paints "⏵⏵ auto mode on" with (read off a live pane as
-# `ESC[38;5;220m`); #ffd500 is a shade deeper and still reads as the same yellow. Every
-# other color is under it by relative luminance: gold .69, the `wait` summary .68, busy
-# .39, every other summary .23. The old #eeeeee summary was .86, brighter than the gold it
-# sat next to, so the row that wanted you was not the loudest one in it. Busy keeps a
-# trace of its old teal rather than going flat grey, since at .39 that hue is the only
-# thing telling its label from the greys at a glance
-STATE = {
-    "wait": ("● wait", "#ffd500"),
-    "free": ("◌ free", "#626262"),
-    "busy": ("◐ busy", "#93aeaa"),
+function sgr(hex, layer) {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return `${ESC}[${layer};2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`;
 }
-KEY = "bold #ceaadf"
-KEYS = Text.assemble(("1-0", KEY), "/", ("enter", KEY), " jump   ",
-                     ("esc", KEY), " quit   ", ("^s", KEY), " sort")
 
-# the digits label the first ten rows, in the order they are drawn
-NUMBERS = "1234567890"
+// A run is {t: text, c: hex fg, b: bold}. Every run starts with a reset, so a run only
+// ever says what it wants and nothing leaks out of the run before it.
+function paint(runs, back, bold = false) {
+  let out = "";
+  for (const r of runs) {
+    if (!r.t) continue;
+    out += RESET + (back ? sgr(back, 48) : "") + (r.c ? sgr(r.c, 38) : "") +
+      (r.b || bold ? BOLD : "") + r.t;
+  }
+  return out + RESET;
+}
 
+// Display width in cells, which String.length is not: a CJK character is one UTF-16
+// unit and two cells, a combining mark is one and none, so widths walk grapheme
+// clusters. The three state glyphs (● ◐ ◌) are East Asian *Ambiguous* and kitty
+// draws ambiguous narrow, so counting them wide pushes the state column one cell out.
+const GRAPHEMES = new Intl.Segmenter(undefined, {granularity: "grapheme"});
+const ZERO = /^[\p{Mn}\p{Me}\p{Cf}]/u;
+const WIDE = /^[\u1100-\u115f\u2329\u232a\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u;
 
-class Table(DataTable):
-    BINDINGS = [Binding("enter", "select_cursor", "jump", show=True)]
+function cell(grapheme) {
+  if (ZERO.test(grapheme)) return 0;
+  // emoji presentation is two cells: U+FE0F asks for it, U+1F300 and up already have it;
+  // below that, © and ™ are pictographic and still drawn narrow
+  if (grapheme.includes("\ufe0f") || grapheme.codePointAt(0) >= 0x1f300) return 2;
+  return WIDE.test(grapheme) ? 2 : 1;
+}
 
-    def on_click(self, event):
-        """Select on the first click. DataTable moves the cursor on click and only
-        selects on a second click; its own `_on_click` has already run by now, so the
-        cursor is on the clicked row. Cell meta carries row -1 for the header."""
-        if event.style.meta.get("row", -1) >= 0:
-            self.action_select_cursor()
+const cells = (s) => [...GRAPHEMES.segment(s)].reduce((n, g) => n + cell(g.segment), 0);
+const span = (runs) => runs.reduce((n, r) => n + cells(r.t), 0);
 
+// Crop to `width` cells and pad out to it. Cropping walks clusters and stops on the
+// budget, so a two-cell character that does not fit leaves a space, not half of itself.
+function fit(runs, width) {
+  const out = [];
+  let n = 0;
+  outer:
+  for (const r of runs) {
+    let t = "";
+    for (const g of GRAPHEMES.segment(r.t)) {
+      const w = cell(g.segment);
+      if (n + w > width) {
+        if (t) out.push({...r, t});
+        break outer;
+      }
+      t += g.segment;
+      n += w;
+    }
+    if (t) out.push({...r, t});
+  }
+  if (n < width) out.push({t: " ".repeat(width - n)});
+  return out;
+}
 
-class CCX(App):
-    CSS = """
-    Screen { background: $background; }
-    #bar { height: 1; background: $panel; }
-    #search { width: 1fr; padding: 0 1; }
-    #status { width: auto; padding: 0 2; color: $secondary; }
-    #keys { width: auto; padding: 0 1; }
-    Rule { height: 1; margin: 0; color: #35284a; }
-    Table { height: 1fr; padding: 0 1; background: $background; scrollbar-size-horizontal: 0; }
-    Table > .datatable--cursor { background: #2a1e38; text-style: bold; }
-    Table > .datatable--header { background: $background; color: $secondary; }
-    """
-    ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [
-        Binding("escape", "quit", "quit"),
-        # App binds ctrl+c to `help_quit`, which only toasts "Press ctrl+q to quit the
-        # app". Every key that reads as "leave" leaves: ctrl+c, ctrl+q (App's own
-        # priority binding, which reaches action_quit below) and escape
-        Binding("ctrl+c", "quit", "quit", show=False, priority=True),
-        Binding("ctrl+s", "cycle_sort", "sort"),
-    ]
+const WIDTHS = [1, 6, 5, 26];        // number, state, for, path; the summary takes the rest
+const HEADS = ["", "state", "for", "path", "summary"];
+const FIXED = WIDTHS.reduce((a, w) => a + w + 2, 0);
 
-    def __init__(self):
-        super().__init__()
-        self.clock = StateClock()
-        self.instances = []
-        self.rows = []
-        self.filter = ""
-        self.sort = SORTS[0]
+function layout(cols) {
+  const inner = Math.max(FIXED + 3, cols - 2);      // one column of margin on each side
+  const widths = [...WIDTHS, inner - FIXED - 2];
+  const xs = [];
+  let x = 1;
+  for (const w of widths) {
+    xs.push(x);
+    x += w + 2;
+  }
+  return {widths, xs, inner};
+}
 
-    def compose(self) -> ComposeResult:
-        with Horizontal(id="bar"):
-            yield Static(id="search")
-            yield Static(id="status")
-            yield Static(KEYS, id="keys")
-        yield Rule(line_style="solid")
-        # cursor_foreground_priority: the cursor row keeps a cell's own color instead of
-        # flattening it to $block-cursor-foreground, so wait stays yellow when selected
-        yield Table(cursor_type="row", zebra_stripes=False,
-                    cursor_foreground_priority="renderable")
+function tableLine(fields, lay, cols, back, bold = false) {
+  const runs = [];
+  fields.forEach((f, n) => runs.push({t: " "}, ...fit(f, lay.widths[n]), {t: " "}));
+  return margins(fit(runs, tableWidth(lay, cols)), cols, back, bold);
+}
 
-    def on_mount(self):
-        self.register_theme(PURPLE)
-        self.theme = "ccx"
-        table = self.query_one(Table)
-        table.add_column("", width=1)          # the digit that jumps to the row
-        table.add_column("state", width=6)
-        table.add_column("for", width=5)
-        table.add_column("path", width=26)
-        table.add_column("summary")
-        self.reload()
-        self.set_interval(1.5, self.reload)
+// As wide as its columns or as the screen, whichever is less: anything narrower crops
+// rather than running the line past the right edge and scrolling the frame.
+const tableWidth = (lay, cols) => Math.max(0, Math.min(lay.inner, cols - 1));
 
-    def reload(self):
-        self.instances = self.clock.update(discover())
-        if self.clock.woke:          # one sound per pass, not one per instance
-            play()
-        self.draw()
+function margins(body, cols, back, bold = false) {
+  return paint([{t: " "}], PALETTE.bg) + paint(body, back, bold) +
+    paint([{t: " ".repeat(Math.max(0, cols - 1 - span(body)))}], PALETTE.bg);
+}
 
-    @property
-    def needle(self):
-        """What is actually matched: the filter with its ends trimmed. A leading space
-        is how you search for something starting with a digit, since a digit typed into
-        an *empty* filter picks a row instead; " 3" then matches the same as "3"."""
-        return self.filter.strip().lower()
+function marks(text, color, needle) {
+  if (!needle) return [{t: text, c: color}];
+  const hit = fuzzy(needle, text);
+  if (!hit) return [{t: text, c: color}];
+  // fuzzy() returns UTF-16 indices, so walk code points and carry the offset: splitting a
+  // surrogate pair into two runs would put an SGR sequence through the middle of it
+  const on = new Set(hit.idx);
+  const runs = [];
+  let i = 0;
+  for (const ch of text) {
+    const b = on.has(i);
+    const last = runs.at(-1);
+    if (last && !!last.b === b) last.t += ch;
+    else runs.push({t: ch, c: b ? PALETTE.accent : color, b});
+    i += ch.length;
+  }
+  return runs;
+}
 
-    def mark(self, text, style):
-        """Paint the matched characters, so a loose match shows what it matched on."""
-        out = Text(text, style=style)
-        hit = fuzzy(self.needle, text) if self.needle else None
-        for i in hit[1] if hit else ():
-            out.stylize(KEY, i, i + 1)
-        return out
+const KEY = (t) => ({t, c: PALETTE.accent, b: true});
+const KEYS = [KEY("1-0"), {t: "/", c: PALETTE.text}, KEY("enter"),
+  {t: " jump   ", c: PALETTE.text}, KEY("esc"), {t: " quit   ", c: PALETTE.text},
+  KEY("^s"), {t: " sort", c: PALETTE.text}];
 
-    def draw(self):
-        table = self.query_one(Table)
-        # follow the instance under the cursor, not the row number: sorting by state
-        # reorders rows as instances change state, and the cursor would drift
-        under = self.rows[table.cursor_row].pid if 0 <= table.cursor_row < len(self.rows) else None
-        self.rows = rank(self.instances, self.needle, self.sort)
-        table.clear()
-        for n, inst in enumerate(self.rows):
-            mark, style = STATE[inst.state]
-            table.add_row(
-                Text(NUMBERS[n] if n < len(NUMBERS) else " ", style="#626262"),
-                Text(mark, style=style),
-                Text(inst.age, style="#626262"),
-                self.mark(inst.short_path, "#b8a0be"),
-                self.mark(inst.summary, "#d6d6dc" if inst.state == "wait" else "#82828a"),
-            )
-        if self.rows:
-            keep = next((n for n, i in enumerate(self.rows) if i.pid == under), None)
-            table.move_cursor(row=keep if keep is not None else 0)
+function barLine(view, cols) {
+  const search = view.filter
+    ? [{t: `/${view.filter}`, c: PALETTE.accent}]
+    : [{t: "type to filter", c: PALETTE.hint}];
+  const count = view.filter
+    ? `${view.ranked.length} of ${view.total}`
+    : `${view.waiting}/${view.total}`;
+  const loud = view.waiting > 0 && !view.filter;
+  const status = [{t: count, c: loud ? PALETTE.gold : PALETTE.mauve, b: loud},
+    {t: `  ·  by ${view.sort}`, c: PALETTE.mauve}];
+  // the hints go first on a narrow screen: the counts are the only place the number of
+  // waiting sessions is written
+  const room = cols - span(status) - 4;
+  const keys = room - span(KEYS) - 2 >= 16 ? [{t: " "}, ...KEYS, {t: " "}] : [];
+  const left = Math.max(0, room - span(keys) - 1);
+  return paint(fit([{t: " "}, ...fit(search, left), {t: "  "}, ...status, {t: "  "},
+    ...keys], cols), PALETTE.bar);
+}
 
-        waiting = sum(i.state == "wait" for i in self.instances)
-        self.title = f"claude code · {len(self.instances)} running"
-        self.query_one("#search", Static).update(
-            Text(f"/{self.filter}", style="#ceaadf") if self.filter
-            else Text("type to filter", style="#4a4a55"))
-        count = (f"{len(self.rows)} of {len(self.instances)}" if self.filter
-                 else f"{waiting}/{len(self.instances)}")
-        self.query_one("#status", Static).update(Text.assemble(
-            (count, "bold #ffd500" if waiting and not self.filter else "#b8a0be"),
-            (f"  ·  by {self.sort}", "#b8a0be")))
+function ruleLine(cols) {
+  return paint([{t: "─".repeat(cols), c: PALETTE.edge}], PALETTE.bg);
+}
 
-    # a digit typed into an empty filter picks its row; any other printable key filters
-    def on_key(self, event):
-        if not self.filter and event.character and event.character in NUMBERS:
-            event.stop()
-            self.jump_row(NUMBERS.index(event.character))
-            return
-        if event.key == "backspace":
-            self.filter = self.filter[:-1]
-        elif event.character and event.character.isprintable():
-            self.filter += event.character
-        else:
-            return
-        event.stop()
-        self.draw()
+function headerLine(lay, cols) {
+  return tableLine(HEADS.map((h) => [{t: h, c: PALETTE.mauve, b: true}]), lay, cols,
+    PALETTE.bg);
+}
 
-    def action_quit(self):
-        """Leave without Textual's shutdown, which costs ~200ms of waiting.
+function rowLine(inst, n, cursor, lay, cols, needle) {
+  const state = STATE[inst.state] ?? STATE.free;
+  return tableLine([
+    [{t: n < NUMBERS.length ? NUMBERS[n] : " ", c: PALETTE.dim}],
+    [{t: state.label, c: state.color}],
+    [{t: inst.age, c: PALETTE.dim}],
+    marks(inst.shortPath, PALETTE.mauve, needle),
+    marks(inst.summary, inst.state === "wait" ? PALETTE.text : PALETTE.idle, needle),
+  ], lay, cols, cursor ? PALETTE.cursor : PALETTE.bg, cursor);
+}
 
-        `App.exit()` ends in `LinuxDriver.disable_input`, which joins the input thread;
-        that thread polls stdin with a 0.1s timeout and then polls once more on the way
-        out, so the join alone measures 0.205s. Undoing application mode is only the
-        writes below plus `tcsetattr`, so do them and go: 0.36s to 0.12s. What is left is
-        tmux hiding kitty's keyboard protocol from us (`extended-keys off`), so a bare
-        ESC is ambiguous and Textual's parser waits ~100ms for the rest of a sequence.
+// One line across the table, indented to where the state column starts.
+function noteLine(text, lay, cols) {
+  return margins(fit([{t: " ".repeat(lay.xs[1])}, {t: text, c: PALETTE.hint}],
+    tableWidth(lay, cols)), cols, PALETTE.bg);
+}
 
-        Every attribute touched here is Textual-private; if an upgrade moves one, fall
-        back to the slow exit rather than leaving the terminal in application mode.
-        """
-        driver = self._driver
-        try:
-            driver._disable_bracketed_paste()
-            driver._enable_line_wrap()
-            driver._disable_in_band_window_resize()
-            driver._disable_mouse_support()
-            driver.write("\x1b[<u")      # kitty keyboard protocol off, before alt screen
-            driver.write("\x1b[?1049l")  # leave the alt screen
-            driver.write("\x1b[?25h")    # show the cursor
-            driver.write("\x1b[?1004l")  # FocusIn/FocusOut off
-            if driver.attrs_before is not None:
-                with contextlib.suppress(termios.error):
-                    termios.tcsetattr(driver.fileno, termios.TCSANOW, driver.attrs_before)
-            driver._writer_thread.stop()  # drains the write queue, then joins
-        except Exception:
-            self.exit()
-            return
-        for cleanup in ON_EXIT:
-            cleanup()
-        os._exit(0)
+function toastLine(text, cols) {
+  const body = fit([{t: ` ${text} `, c: PALETTE.error}],
+    Math.min(Math.max(0, cols - 1), cells(text) + 2));
+  const gap = Math.max(0, cols - 1 - span(body));
+  return paint([{t: " ".repeat(gap)}], PALETTE.bg) + paint(body, PALETTE.bar) +
+    paint([{t: " "}], PALETTE.bg);
+}
 
-    def action_cycle_sort(self):
-        self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
-        self.draw()
+function capacity(height, total) {
+  const room = Math.max(1, height - 3);
+  return total > room ? Math.max(1, room - 1) : room;
+}
 
-    def jump_row(self, row):
-        """Focus that instance and stay open. Only a quit key quits."""
-        if not 0 <= row < len(self.rows):
-            return
-        self.query_one(Table).move_cursor(row=row)   # so the cursor shows what was taken
-        if err := jump(self.rows[row]):              # silent on success, toast on failure
-            self.notify(err, severity="warning", timeout=2)
+function render(view) {
+  const {cols, height} = view;
+  const lay = layout(cols);
+  const lines = [barLine(view, cols), ruleLine(cols), headerLine(lay, cols)];
+  const room = capacity(height, view.ranked.length);
+  const shown = view.ranked.slice(view.offset, view.offset + room);
+  if (!view.ranked.length) {
+    lines.push(noteLine(view.total ? "nothing matches that filter" : "no claude instances",
+      lay, cols));
+  }
+  shown.forEach((inst, n) => lines.push(rowLine(inst, view.offset + n,
+    view.offset + n === view.cursor, lay, cols, view.needle)));
+  const blank = paint([{t: " ".repeat(cols)}], PALETTE.bg);
+  while (lines.length < height) lines.push(blank);
+  lines.length = height;                       // a screen too short crops from the bottom
+  const hidden = view.ranked.length - shown.length;
+  if (hidden > 0) lines[height - 1] = noteLine(`${hidden} more`, lay, cols);
+  if (view.toast) lines[height - 1] = toastLine(view.toast, cols);
+  return lines;
+}
 
-    def action_jump(self):
-        self.jump_row(self.query_one(Table).cursor_row)
+// ------------------------------------------------------------------------------ the tui
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        self.action_jump()
+const app = {
+  clock: new StateClock(),
+  instances: [],
+  ranked: [],
+  filter: "",
+  sort: SORTS[0],
+  cursorPid: null,
+  cursor: 0,
+  offset: 0,
+  toast: null,
+  fade: 0,
+};
 
-    def on_data_table_header_selected(self, event: DataTable.HeaderSelected):
-        if (label := str(event.label)) in SORTS:      # clicking a header sorts by it
-            self.sort = label
-            self.draw()
+const OUT = new TextEncoder();
+const IN = new TextDecoder();
+const write = (s) => Deno.stdout.writeSync(OUT.encode(s));
 
+function size() {
+  try {
+    const {columns, rows} = Deno.consoleSize();
+    return {cols: columns, height: rows};
+  } catch {
+    return {cols: 100, height: 24};            // no tty, which only --snapshot reaches
+  }
+}
 
-# ---------------------------------------------------------------------------- cli
+// The filter with its ends trimmed. A leading space is how to search for something
+// starting with a digit, since a digit in an *empty* filter picks a row instead.
+const needle = () => app.filter.trim().toLowerCase();
 
-def cmd_ui():
-    with tmux_window_name("ccx"), kitty_window_title("ccx"):
-        CCX().run()
+function view() {
+  const {cols, height} = size();
+  return {
+    ranked: app.ranked,
+    total: app.instances.length,
+    waiting: app.instances.filter((i) => i.state === "wait").length,
+    filter: app.filter,
+    needle: needle(),
+    sort: app.sort,
+    cursor: app.cursor,
+    offset: app.offset,
+    toast: app.toast,
+    cols,
+    height,
+  };
+}
 
+function reload() {
+  app.instances = app.clock.update(discover());
+  if (app.clock.woke.length) play();           // one sound per pass, not one per instance
+  refresh();
+}
 
-def cmd_list():
-    for i in StateClock().update(discover()):
-        print(f"{STATE[i.state][0]:<6} {i.age:>4}  {i.short_path:<30} {i.summary}")
+function refresh() {
+  app.ranked = rank(app.instances, needle(), app.sort);
+  const at = app.ranked.findIndex((i) => i.pid === app.cursorPid);
+  app.cursor = at >= 0 ? at : 0;
+  app.cursorPid = app.ranked[app.cursor]?.pid ?? null;
+  const room = capacity(size().height, app.ranked.length);
+  app.offset = Math.max(0, Math.min(app.offset, app.ranked.length - room, app.cursor));
+  app.offset = Math.max(app.offset, app.cursor - room + 1);
+}
 
+function draw() {
+  write(`${ESC}[H${render(view()).join("\r\n")}`);
+}
 
-def cmd_doctor():
-    print(f"TMUX={os.environ.get('TMUX', '(none)')}  "
-          f"KITTY_WINDOW_ID={os.environ.get('KITTY_WINDOW_ID', '(none)')}")
-    print(f"tmux allow-passthrough: {sh('tmux', 'show', '-gv', 'allow-passthrough').strip()}")
-    # the two per-platform pieces, so a box that jumps but stays silent says which
-    print(f"platform {sys.platform}  bell {ringer()}  "
-          f"sound {len(sound())}B of wav, straight from memory")
-    records = session_records()
-    for i in discover():
-        rec = records.get(i.pid, {})
-        print(f"  pid {i.pid} pane {i.pane or '-'} session {i.session or '-'} "
-              f"state {i.state or '?'} record {rec.get('status', '(none)')}"
-              f"{'/' + rec['waitingFor'] if rec.get('waitingFor') else ''} "
-              f"match {i.match or '(unresolved)'} raise {raise_target(i)}")
+// Both, not just the pid: one read can carry eight arrow keys and refresh() runs once at
+// the end of it, so a stale app.cursor would compute all eight from the same row.
+function move(delta) {
+  if (!app.ranked.length) return;
+  app.cursor = Math.max(0, Math.min(app.ranked.length - 1, app.cursor + delta));
+  app.cursorPid = app.ranked[app.cursor].pid;
+}
 
+function jumpRow(n) {
+  if (n < 0 || n >= app.ranked.length) return;
+  app.cursor = n;                              // so the cursor shows what was taken
+  app.cursorPid = app.ranked[n].pid;
+  const err = jump(app.ranked[n]);
+  if (err) toast(err);
+}
 
-def cmd_focus(pid=None):
-    for i in discover():
-        if str(i.pid) == pid:
-            if err := jump(i):
-                print(err, file=sys.stderr)
-            return
-    print(f"no claude instance with pid {pid}", file=sys.stderr)
+function toast(text) {
+  app.toast = text;
+  clearTimeout(app.fade);
+  app.fade = setTimeout(() => {
+    app.toast = null;
+    draw();
+  }, 2000);
+}
 
+function sortAt(col, lay) {
+  const n = lay.xs.findIndex((x, i) => col >= x && col < x + lay.widths[i] + 2);
+  if (SORTS.includes(HEADS[n])) app.sort = HEADS[n];
+}
 
-COMMANDS = {"ui": cmd_ui, "list": cmd_list, "doctor": cmd_doctor, "focus": cmd_focus}
+// The check reads the raw filter and not the needle, or a lone space would strip back to
+// empty and the escape hatch would pick a row instead of filtering.
+function typed(ch) {
+  if (!app.filter && NUMBERS.includes(ch)) {
+    jumpRow(NUMBERS.indexOf(ch));
+    return;
+  }
+  app.filter += ch;
+}
 
-if __name__ == "__main__":
-    name, *rest = sys.argv[1:] or ["ui"]
-    if name not in COMMANDS:
-        sys.exit(f"usage: ccx [{' | '.join(COMMANDS)}]")
-    COMMANDS[name](*rest)
+function mouse(body, final) {
+  if (final !== "M") return;                   // a release; the press already acted
+  const [b, x, y] = body.slice(1).split(";").map(Number);
+  if (b & 64) return move(b & 1 ? 1 : -1);     // the wheel moves the cursor
+  if ((b & 3) !== 0) return;                   // not the left button
+  const lay = layout(size().cols);
+  if (y - 1 === 2) return sortAt(x - 1, lay);  // the header row
+  if (y - 1 >= 3) jumpRow(app.offset + y - 4); // a single click jumps, without closing
+}
+
+function csi(body, final) {
+  if (body.startsWith("<")) return mouse(body, final);
+  const key = body + final;
+  if (key === "A") return move(-1);
+  if (key === "B") return move(1);
+  if (key === "5~") return move(-capacity(size().height, app.ranked.length));
+  if (key === "6~") return move(capacity(size().height, app.ranked.length));
+  if (key === "H" || key === "1~") return move(-app.ranked.length);
+  if (key === "F" || key === "4~") return move(app.ranked.length);
+}
+
+// A read that is exactly the single byte 0x1b is the escape key, with no timer behind it:
+// a real sequence always arrives in the same read as its ESC.
+function handle(chunk) {
+  if (chunk.length === 1 && chunk[0] === 0x1b) return quit();
+  let i = 0;
+  while (i < chunk.length) {
+    const b = chunk[i];
+    if (b === 0x1b && chunk[i + 1] === 0x5b) {                    // CSI
+      let j = i + 2;
+      while (j < chunk.length && chunk[j] >= 0x20 && chunk[j] <= 0x3f) j++;
+      if (j >= chunk.length) break;   // a sequence split across two reads, rather than
+      csi(IN.decode(chunk.subarray(i + 2, j)), String.fromCharCode(chunk[j]));
+      i = j + 1;                      // its tail arriving in the filter as text
+      continue;
+    }
+    if (b === 0x1b || b === 0x03 || b === 0x11) return quit();     // esc, ctrl+c, ctrl+q
+    if (b === 0x13) {                                              // ctrl+s
+      app.sort = SORTS[(SORTS.indexOf(app.sort) + 1) % SORTS.length];
+      i++;
+      continue;
+    }
+    if (b === 0x0d || b === 0x0a) {
+      jumpRow(app.cursor);
+      i++;
+      continue;
+    }
+    if (b === 0x7f || b === 0x08) {
+      app.filter = app.filter.slice(0, -1);
+      i++;
+      continue;
+    }
+    if (b < 0x20) {
+      i++;
+      continue;
+    }
+    // a run of printable bytes, decoded together so a multi-byte character survives
+    let j = i;
+    while (j < chunk.length && chunk[j] >= 0x20 && chunk[j] !== 0x7f && chunk[j] !== 0x1b) j++;
+    for (const ch of IN.decode(chunk.subarray(i, j))) typed(ch);
+    i = j;
+  }
+}
+
+// The alternate screen also hides the two runtime lines the compiled bundle prints at
+// startup. Line wrap off (?7l), or writing the last cell of the last row scrolls the frame.
+function enter() {
+  Deno.stdin.setRaw(true);
+  write(`${ESC}[?1049h${ESC}[?25l${ESC}[?7l${ESC}[?1000h${ESC}[?1006h${ESC}[2J`);
+}
+
+function leave() {
+  write(`${ESC}[?1006l${ESC}[?1000l${ESC}[?7h${ESC}[?25h${ESC}[?1049l`);
+  try {
+    Deno.stdin.setRaw(false);
+  } catch { /* stdin already gone, which is the SIGHUP path */ }
+}
+
+let restores = [];
+
+// escape to gone in 2ms, and 10ms for ctrl+c or ctrl+q, measured in a pty.
+function quit() {
+  leave();
+  for (const f of restores) f();     // the tmux tab name and the kitty window title
+  for (const f of ON_EXIT) f();      // whatever the library still has registered
+  Deno.exit(0);
+}
+
+async function cmdUi() {
+  // no tty means nothing to put in raw mode, and setRaw would throw instead
+  if (!Deno.stdin.isTerminal()) {
+    console.error("ccx is a terminal app: try `ccx list` or `ccx --snapshot`");
+    Deno.exit(2);
+  }
+  await loadBell();                  // play() is a no-op until this runs, and a poll cannot await
+  restores = [tmuxWindowName("ccx"), kittyWindowTitle("ccx")];
+  enter();
+  for (const sig of ["SIGTERM", "SIGHUP"]) Deno.addSignalListener(sig, quit);
+  Deno.addSignalListener("SIGWINCH", () => {
+    write(`${ESC}[2J`);              // a shrink leaves the old frame's tail on the screen
+    refresh();
+    draw();
+  });
+  reload();
+  draw();
+  setInterval(() => {
+    reload();
+    draw();
+  }, 1500);
+  const buf = new Uint8Array(4096);
+  try {
+    while (true) {
+      const n = await Deno.stdin.read(buf);
+      if (n === null) break;         // stdin closed under us
+      handle(buf.subarray(0, n));
+      refresh();
+      draw();
+    }
+  } catch (e) {
+    leave();                         // a traceback is unreadable on the alternate screen
+    for (const f of ON_EXIT) f();
+    throw e;
+  }
+  quit();
+}
+
+// ---------------------------------------------------------------------------- snapshot
+
+// Fixed rows, so the frame is the same every time: a snapshot with a live discover() in
+// it is not reproducible.
+const NOW = 1_700_000_000;
+const SAMPLE = [
+  ["wait", 42, "~/prj/ccx", "port ccx from python to deno"],
+  ["busy", 197, "~/prj/wrangler", "wrangler config for the edge worker"],
+  ["free", 8100, "~/web/blob2", ""],
+  ["wait", 7, "~/blah", "reorganize the skills tree"],
+  ["busy", 1500, "~/prj/ccx:2", "inline the bell and play it from memory"],
+  // two-cell characters, so a width that counted code units shows up here as a summary
+  // column one row out of line with the others
+  ["wait", 320, "~/prj/kanji", "日本語のタイトル in a session title"],
+];
+
+function sample() {
+  // duck-typed: rank() and render() read shortPath, summary, state, since, pid and age
+  return SAMPLE.map(([state, ago, shortPath, summary], n) => ({
+    pid: 1000 + n, state, summary, shortPath, since: NOW - ago,
+    age: ago < 60 ? `${ago}s`
+      : ago < 3600 ? `${Math.floor(ago / 60)}m` : `${Math.floor(ago / 3600)}h`,
+  }));
+}
+
+// ccx --snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast]
+function cmdSnapshot(...args) {
+  let cols = 100, height = 14, plain = false, filter = "", rows = sample(), toast = null;
+  for (const a of args) {
+    const wh = /^(\d+)x(\d+)$/.exec(a);
+    if (wh) [cols, height] = [Number(wh[1]), Number(wh[2])];
+    else if (a === "plain") plain = true;
+    else if (a === "empty") rows = [];
+    else if (a === "toast") toast = "pid 1000 is not inside tmux; nothing to focus";
+    else if (a.startsWith("/")) filter = a.slice(1);
+    else return usage();
+  }
+  const needle = filter.trim().toLowerCase();
+  const ranked = rank(rows, needle, SORTS[0]);
+  const frame = render({
+    ranked, total: rows.length, waiting: rows.filter((i) => i.state === "wait").length,
+    filter, needle, sort: SORTS[0], cursor: 0, offset: 0, toast, cols, height,
+  }).join("\n");
+  console.log(plain ? frame.replaceAll(SGR, "") : frame);
+}
+
+// --------------------------------------------------------------------------------- cli
+
+function cmdList() {
+  for (const i of new StateClock().update(discover())) {
+    console.log(`${STATE[i.state].label.padEnd(6)} ${i.age.padStart(4)}  ` +
+      `${i.shortPath.padEnd(30)} ${i.summary}`);
+  }
+}
+
+async function cmdDoctor() {
+  await loadBell();                  // soundBytes() is empty until the gzip has been read
+  console.log(`TMUX=${Deno.env.get("TMUX") ?? "(none)"}  ` +
+    `KITTY_WINDOW_ID=${Deno.env.get("KITTY_WINDOW_ID") ?? "(none)"}`);
+  const pass = sh("tmux", "show", "-gv", "allow-passthrough").trim();
+  console.log(`tmux allow-passthrough: ${pass}`);
+  // the two per-platform pieces, so a box that jumps but stays silent says which
+  console.log(`platform ${Deno.build.os}  bell ${ringer()}  ` +
+    `sound ${soundBytes().length}B of wav, straight from memory`);
+  const records = sessionRecords();
+  for (const i of discover()) {
+    const rec = records[i.pid] ?? {};
+    console.log(`  pid ${i.pid} pane ${i.pane || "-"} session ${i.session || "-"} ` +
+      `state ${i.state || "?"} record ${rec.status ?? "(none)"}` +
+      `${rec.waitingFor ? "/" + rec.waitingFor : ""} ` +
+      `match ${i.match ?? "(unresolved)"} raise ${raiseTarget(i)}`);
+  }
+}
+
+function cmdFocus(pid) {
+  for (const i of discover()) {
+    if (String(i.pid) !== pid) continue;
+    const err = jump(i);
+    if (!err) return;
+    console.error(err);
+    Deno.exit(1);
+  }
+  console.error(`no claude instance with pid ${pid}`);
+  Deno.exit(1);
+}
+
+const BUNDLE = `${import.meta.dirname}/ccx.app`;
+
+// Deno.Tray is undefined under `deno run`, so this branch is both halves: with the
+// desktop globals it *is* the tray, without them it launches the bundle that has them.
+// The import is dynamic so the script path never loads systray.js at all.
+async function cmdSystray(...args) {
+  if (typeof Deno.Tray === "function") {
+    const {runSystray} = await import("./systray.js");
+    await runSystray(args);
+    // deliberately never returns: runSystray() comes back as soon as the tray is up, so
+    // an exit here kills the app before an icon is drawn. systray.js owns quitting.
+    await new Promise(() => {});
+  }
+  // the inner binary's name is fixed: CFBundleExecutable is literally `laufey_webview`
+  if (!(await Deno.stat(`${BUNDLE}/Contents/MacOS/laufey_webview`).catch(() => null))) {
+    console.error("no ccx.app yet; run ./task build");
+    Deno.exit(1);
+  }
+  Deno.exit(await launch(args));
+}
+
+// Detached by LaunchServices (measured: ppid 1, no tty), never a plain exec of the inner
+// binary: that would die with this terminal or tmux pane. Never pass -n; a second `open`
+// activates the copy already running, and does not deliver the new args.
+async function launch(args) {
+  const {code} = await new Deno.Command("open", {
+    args: ["-a", BUNDLE, "--args", "systray", ...args],
+  }).spawn().status;
+  return code;
+}
+
+const COMMANDS = {
+  ui: [cmdUi, 0],
+  list: [cmdList, 0],
+  doctor: [cmdDoctor, 0],
+  focus: [cmdFocus, 1],
+  systray: [cmdSystray, -1],         // -1: passes its own flags through to the bundle
+  "--snapshot": [cmdSnapshot, -1],
+};
+
+function usage() {
+  console.error("usage: ccx [list | doctor | focus <pid> | systray | " +
+    "--snapshot [<cols>x<rows>] [plain]]");
+  Deno.exit(2);
+}
+
+// Everything but `systray` runs as this script and never through the built binary: the
+// desktop runtime prints two lines to stdout before any user code, which would land
+// ahead of a listing. Do not "simplify" this into always execing the app.
+const [name = "ui", ...rest] = Deno.args;
+const cmd = COMMANDS[name];
+if (!cmd || (cmd[1] >= 0 && rest.length !== cmd[1])) usage();
+await cmd[0](...rest);
+// the built runtime does not exit when the module finishes
+Deno.exit(0);

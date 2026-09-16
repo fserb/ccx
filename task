@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+APP=ccx.app
+
+build() {
+  local tmp
+  tmp=$(mktemp -d)
+  deno run -A --ext=js - "$tmp/icon.png" <<'JS'
+import { iconPng } from "./icon.js";
+Deno.writeFileSync(Deno.args[0], await iconPng(["wait", "busy", "free"], 512 / 18));
+JS
+  deno desktop --ext js -A --backend webview --icon "$tmp/icon.png" -o ccx ccx
+  rm -rf "$tmp"
+}
+
+clean() {
+  rm -rf "$APP"
+}
+
+function help {
+  echo "$0 <task>   # everything else is ./ccx"
+  compgen -A function | grep -v "^_" | cat -n
+}
+
+"${@:-help}"
