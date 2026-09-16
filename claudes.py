@@ -22,18 +22,27 @@ differ, and they are the whole of the per-platform code here: what plays the bel
 how the terminal window itself gets raised. See PLAYERS and raise_window().
 """
 
+import base64
 import contextlib
+import ctypes
+import ctypes.util
+import io
 import json
+import lzma
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import wave
+from array import array
 from dataclasses import dataclass
+from itertools import accumulate
 
 HOME = os.path.expanduser("~")
 MAC = sys.platform == "darwin"
+VOID = ctypes.c_void_p
 
 # ------------------------------------------------------------------ the listing
 
@@ -278,25 +287,22 @@ class StateClock:
 
 # a UI rings this on StateClock.woke; the library itself never makes a sound.
 #
-# macOS ships one player under a name that is always there. Linux ships several under
-# names that are not, so the player is whichever of these is installed, in order of how
-# little it does: pw-play and paplay hand the file to the running sound server, ffplay
-# decodes it itself and is the fallback for a box with neither.
-#
-# The file ships with the repo, so the bell is the same sound on both platforms and does
-# not depend on what the box happens to have installed: freedesktop's complete.oga is a
-# sound-theme package, not part of a base install. It is a copy of macOS's
-# /System/Library/Sounds/Bottle.aiff (0.77s, 24-bit 48kHz stereo). All three Linux
-# players read AIFF: pw-play and paplay decode through libsndfile, ffplay through
-# ffmpeg.
+# The sound is BOTTLE, at the bottom of this file, so the bell is the same one on both
+# platforms: freedesktop's complete.oga, the old Linux default, ships with a sound theme
+# and not with a base install. Nothing here writes a file. macOS plays the bytes through
+# AVAudioPlayer (see ring()), Linux pipes them to a player's stdin, and each argv ends in
+# how that player spells stdin: `paplay -` opens a file named `-` and fails, so paplay
+# gets nothing. In order of how little they do; ffplay decodes it itself.
 if MAC:
-    PLAYERS = [["afplay"]]
+    PLAYERS = []
 else:
-    PLAYERS = [["pw-play"], ["paplay"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]]
-SOUND = os.environ.get(
-    "CCX_SOUND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bottle.aiff"))
+    PLAYERS = [["pw-play", "-"], ["paplay"],
+               ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-"]]
 PLAYER = None            # resolved on the first ring, then reused
 PLAYING = []
+BELL = None              # BOTTLE unpacked, on the first ring
+RINGER = None            # the AVAudioPlayer holding it, on the first ring; macOS only
+OBJC = None              # (send, class, selector), once libobjc is loaded
 
 
 def bell():
@@ -307,23 +313,91 @@ def bell():
     return PLAYER
 
 
-def play(sound=SOUND):
-    """Play a sound and return immediately.
+def ringer():
+    """What will make the sound, for doctor."""
+    return "AVAudioPlayer" if MAC else " ".join(bell()) or "(no player)"
 
-    The player runs for the length of the file (1.6s for afplay: 0.8s of sound plus
-    startup) and reload() calls this on the UI thread every 1.5s, so it cannot be
-    waited on. An unwaited child stays a zombie until the process dies, hence the poll of
-    the earlier ones; SIGCHLD cannot be ignored instead, because sh() uses subprocess.run
-    and needs its own children to be reapable. No player installed, or a sound file that
-    is not there, is simply no sound.
+
+def sound():
+    """BOTTLE unpacked into the bytes of a WAV file, once."""
+    global BELL
+    if BELL is None:
+        deltas = array("h")
+        deltas.frombytes(lzma.decompress(base64.b64decode(BOTTLE)))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(array("h", accumulate(accumulate(deltas))).tobytes())
+        BELL = buf.getvalue()
+    return BELL
+
+
+def ring(wav):
+    """Play wav through AVAudioPlayer, which takes bytes and wants no file. macOS.
+
+    No macOS player reads stdin: afplay opens through AudioFile, which seeks, so a pipe
+    and a fifo both die with AudioFileOpen failed. ctypes and not PyObjC because this
+    file is stdlib-only. Built once (~120ms) and rewound per ring (0.12ms).
+
+    The stop is not optional. Once the sound has run out, play on its own returns YES and
+    does nothing, with isPlaying false and currentTime stuck at 0 (measured);
+    prepareToPlay does not help. It also makes a ring during a ring retrigger.
+
+    alloc/init throughout: the class constructors autorelease, and a process with no
+    Cocoa loop has no pool to drain, which the runtime complains about on stderr, i.e.
+    onto the TUI. Nothing is released, so the player outlives the ring on purpose.
     """
+    global OBJC, RINGER
+    if OBJC is None:
+        objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+        ctypes.CDLL("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
+        objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
+        at = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        # a prototype per signature: on arm64 a variadic call passes arguments
+        # differently, so objc_msgSend cannot be called untyped
+        OBJC = (lambda ret, *args: ctypes.CFUNCTYPE(ret, VOID, VOID, *args)(at),
+                lambda name: VOID(objc.objc_getClass(name.encode())),
+                lambda name: VOID(objc.sel_registerName(name.encode())))
+    send, cls, sel = OBJC
+    if RINGER is None:
+        data = VOID(send(VOID, ctypes.c_char_p, ctypes.c_size_t)(
+            VOID(send(VOID)(cls("NSData"), sel("alloc"))),
+            sel("initWithBytes:length:"), wav, len(wav)))
+        RINGER = VOID(send(VOID, VOID, VOID)(
+            VOID(send(VOID)(cls("AVAudioPlayer"), sel("alloc"))),
+            sel("initWithData:error:"), data, None))
+        if not RINGER.value:
+            return
+        send(ctypes.c_bool)(RINGER, sel("prepareToPlay"))
+    send(ctypes.c_bool)(RINGER, sel("stop"))
+    send(None, ctypes.c_double)(RINGER, sel("setCurrentTime:"), 0.0)
+    send(ctypes.c_bool)(RINGER, sel("play"))
+
+
+def play():
+    """Ring the bell and return immediately.
+
+    The WAV is 17684 bytes, under the 64KB a pipe holds, so the write cannot block on a
+    player that is slow to start. The player runs 0.4s and reload() calls this on the UI
+    thread every 1.5s, so it is never waited on; an unwaited child is a zombie until the
+    poll above collects it, and SIGCHLD cannot be ignored instead because sh() needs its
+    own children reapable. No player installed is no sound.
+    """
+    if MAC:
+        with contextlib.suppress(OSError):
+            ring(sound())
+        return
     PLAYING[:] = [p for p in PLAYING if p.poll() is None]
     if not (cmd := bell()):
         return
     with contextlib.suppress(OSError):
-        PLAYING.append(subprocess.Popen([*cmd, sound],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        PLAYING.append(p)
+        with p.stdin as pipe:      # closed even if a player that died mid-write breaks it
+            pipe.write(sound())
 
 
 IS_CLAUDE = re.compile(r"(^|/)claude(\s|$)|\.claude/local/.*cli\.js")
@@ -712,3 +786,65 @@ def kitty_window_title(name):
     finally:
         ON_EXIT.remove(restore)
         restore()
+
+
+# ------------------------------------------------------------------ the bell, inlined
+
+# macOS's /System/Library/Sounds/Bottle.aiff, cut down to fit in a source file. The
+# original is 223KB, which is 300KB of base64 and 180KB even under lzma. To redo it:
+#
+#     afconvert -f WAVE -d LEI16@22050 -c 2 Bottle.aiff b.wav    # a real resampler
+#     x = (left + right) / 2, cut to 0.40s, 40ms fade, round(x / 16) * 16
+#     base64(lzma.compress(second differences of x, as little-endian int16))
+#
+# The cuts cost noise 63dB under the peak, against a recording whose own quietest 10ms
+# is 53dB under it; the 0.37s dropped off the end is that floor and nothing else, peaking
+# 45dB down. The second differences are what makes it small: a 185Hz tone barely moves
+# between samples, so 17640 bytes of PCM that lzma alone gets to 6120 go to 3128.
+RATE = 22050
+BOTTLE = """
+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
+"""

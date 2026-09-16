@@ -26,9 +26,9 @@ from textual.containers import Horizontal
 from textual.theme import Theme
 from textual.widgets import DataTable, Rule, Static
 
-from claudes import (ON_EXIT, SORTS, SOUND, StateClock, bell, discover, fuzzy,
-                     jump, kitty_window_title, play, rank, raise_target,
-                     session_records, sh, tmux_window_name)
+from claudes import (ON_EXIT, SORTS, StateClock, discover, fuzzy, jump,
+                     kitty_window_title, play, rank, raise_target, ringer,
+                     session_records, sh, sound, tmux_window_name)
 
 # ----------------------------------------------------------------------------- ui
 
@@ -277,8 +277,8 @@ def cmd_doctor():
           f"KITTY_WINDOW_ID={os.environ.get('KITTY_WINDOW_ID', '(none)')}")
     print(f"tmux allow-passthrough: {sh('tmux', 'show', '-gv', 'allow-passthrough').strip()}")
     # the two per-platform pieces, so a box that jumps but stays silent says which
-    print(f"platform {sys.platform}  bell {' '.join(bell()) or '(no player)'} {SOUND}"
-          f"{'' if os.path.exists(SOUND) else '  (missing)'}")
+    print(f"platform {sys.platform}  bell {ringer()}  "
+          f"sound {len(sound())}B of wav, straight from memory")
     records = session_records()
     for i in discover():
         rec = records.get(i.pid, {})
