@@ -87,15 +87,27 @@ function registerHotkey(fn) {
 
 // --------------------------------------------------------------- the icon keeps its color
 
-/* Clear the template flag on whatever image the status item is showing.
+/* Make the menu bar image draw in our own colors, which Deno's tray will not.
  *
- * `setIcon` hands the PNG to AppKit as a TEMPLATE image, and macOS draws a template as
- * one flat tint, which throws the gold away. Deno's tray offers no way to ask for it, so
- * the flag is cleared on the NSImage itself, reached NSStatusBarWindow -> contentView ->
- * the descendant that answers `image`. A flag on an NSImage is not a geometry call, so it
- * survives this thread, where `setStyleMask:` on a window does not.
+ * `tray.setIcon` reaches laufey_common::SetTrayIconMac, whose ImageFromPng hardcodes
+ * `[img setSize:18x18]; [img setTemplate:YES]` (`mov w2, #0x1`, read out of the binary).
+ * There is no flag and no second argument, and setIconDark goes through the same function.
+ * macOS draws a template as one flat tint, so the gold is thrown away before it is ever on
+ * screen.
  *
- * Has to run after EVERY setIcon: each new image arrives as a template again.
+ * Undoing that is two things, and neither one is enough on its own:
+ *  - CLEAR THE FLAG, but not in the turn that set the icon. SetTrayIconMac builds the
+ *    image inside a block it dispatch_asyncs onto the main queue, so setIcon returns
+ *    before the button has it and a clear in the same turn clears the image being
+ *    replaced; at startup it is worse, since the status item is not in `[NSApp windows]`
+ *    at all until ~72ms after `new Tray()`. An image that is still marked is the signal
+ *    that Deno's block has run, so that is what `recolor` waits for.
+ *  - MAKE THE BUTTON DRAW AGAIN. Clearing the flag on the live image repaints nothing
+ *    (measured: pixel-identical screenshots). `setImage:` does, and it has to go through
+ *    performSelectorOnMainThread:, since Deno's JS thread is not AppKit's main thread.
+ * Deno's own image is kept rather than replaced by one of ours, so the re-apply that
+ * follows an AppleInterfaceThemeChangedNotification hands the button back the same
+ * un-templated object instead of a fresh marked one.
  */
 let OBJC = null;
 
@@ -107,41 +119,74 @@ function objc() {
       msg: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "pointer"},
       count: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "u64"},
       at: {name: "objc_msgSend", parameters: ["pointer", "pointer", "u64"], result: "pointer"},
-      responds: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "pointer"], result: "bool"},
+      flag: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "bool"},
       setFlag: {name: "objc_msgSend",
         parameters: ["pointer", "pointer", "bool"], result: "void"},
+      perform: {name: "objc_msgSend",
+        parameters: ["pointer", "pointer", "pointer", "pointer", "bool"], result: "void"},
     }).symbols;
   }
   return OBJC;
 }
 
 const CSTR = new TextEncoder();
+const PLACED = 25;          // ms between tries while the status item is being placed
+const TRIES = 40;           // ~1s in all, against the ~72ms it takes
 
-function untemplate() {
+// The NSStatusBarButton, or null while the item has not been placed.
+// NSStatusBarWindow -> NSStatusBarContentView -> NSView -> NSStatusBarButton, measured.
+// `[[NSStatusBar systemStatusBar] _statusItems]` reaches the same button in two hops and
+// is both private and an NSConcretePointerArray, which throws on objectAtIndex:.
+function statusButton() {
+  const s = objc();
+  const sel = (n) => s.sel_registerName(CSTR.encode(`${n}\0`));
+  const named = (o) => new Deno.UnsafePointerView(
+    s.msg(s.msg(o, sel("className")), sel("UTF8String"))).getCString();
+
+  const hunt = (view) => {
+    if (view === null) return null;
+    if (named(view).includes("StatusBarButton")) return view;
+    const subs = s.msg(view, sel("subviews"));
+    const n = Number(s.count(subs, sel("count")));
+    for (let k = 0; k < n; k++) {
+      const found = hunt(s.at(subs, sel("objectAtIndex:"), BigInt(k)));
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const app = s.msg(s.objc_getClass(CSTR.encode("NSApplication\0")), sel("sharedApplication"));
+  const windows = s.msg(app, sel("windows"));
+  const n = Number(s.count(windows, sel("count")));
+  for (let k = 0; k < n; k++) {
+    const w = s.at(windows, sel("objectAtIndex:"), BigInt(k));
+    if (!named(w).includes("StatusBar")) continue;
+    const found = hunt(s.msg(w, sel("contentView")));
+    if (found) return found;
+  }
+  return null;
+}
+
+/* Take the template flag off the image the last `setIcon` put on the button, and make the
+ * button draw it again. Retries while the item is unplaced or Deno's block has not run.
+ *
+ * `stale` says a newer icon is on its way, which is what keeps a retry from painting a
+ * listing that has moved on.
+ */
+function recolor(stale, tries = 0) {
   try {
+    if (stale()) return;
     const s = objc();
     const sel = (n) => s.sel_registerName(CSTR.encode(`${n}\0`));
-    const named = (o) => new Deno.UnsafePointerView(
-      s.msg(s.msg(o, sel("className")), sel("UTF8String"))).getCString();
-
-    const clear = (view) => {
-      if (s.responds(view, sel("respondsToSelector:"), sel("image"))) {
-        const image = s.msg(view, sel("image"));
-        if (image !== null) s.setFlag(image, sel("setTemplate:"), false);
-      }
-      const subs = s.msg(view, sel("subviews"));
-      const n = Number(s.count(subs, sel("count")));
-      for (let k = 0; k < n; k++) clear(s.at(subs, sel("objectAtIndex:"), BigInt(k)));
-    };
-
-    const app = s.msg(s.objc_getClass(CSTR.encode("NSApplication\0")), sel("sharedApplication"));
-    const windows = s.msg(app, sel("windows"));
-    const n = Number(s.count(windows, sel("count")));
-    for (let k = 0; k < n; k++) {
-      const w = s.at(windows, sel("objectAtIndex:"), BigInt(k));
-      if (named(w).includes("StatusBar")) clear(s.msg(w, sel("contentView")));
+    const button = statusButton();
+    const image = button === null ? null : s.msg(button, sel("image"));
+    if (image === null || !s.flag(image, sel("isTemplate"))) {
+      if (tries < TRIES) setTimeout(() => recolor(stale, tries + 1), PLACED);
+      return;
     }
+    s.setFlag(image, sel("setTemplate:"), false);
+    s.perform(button, sel("performSelectorOnMainThread:withObject:waitUntilDone:"),
+      sel("setImage:"), image, false);
   } catch {
     // a monochrome icon is worth more than a menu bar app that died drawing one
   }
@@ -479,6 +524,35 @@ function pageWith(view) {
 // The desktop globals are not in Deno's types, and they are absent under `deno run`.
 const desktop = /** @type {any} */ (Deno);
 
+/* Close the window the first `BrowserWindow` adopted, as soon as the panel is up.
+ *
+ * CLOSE AND NOT HIDE. `hide()` on it is not durable: it takes (`isVisible()` goes false
+ * and the window leaves the screen), and then the runtime puts it back up ~5s later and it
+ * stays for the life of the app, still on screen at 65s, buried a dozen windows deep where
+ * it is easy to miss. `close()` holds: `isClosed` is true at 10s and 20s and the window is
+ * gone from the CG list entirely. A poll of ours is not what re-shows it; a probe with no
+ * poll, no setIcon and no setSize does the same.
+ *
+ * `close()` also does not need the window ordered in first, which `hide()` does, so
+ * nothing here waits for the runtime's ~250ms order-in and the adopted window never
+ * reaches the screen at all. Waiting for it cost a 130-140ms flash of a blank 800x628
+ * window, measured over three runs.
+ *
+ * The one thing that IS waited for is the panel, because DISPOSING OF THE LAST VISIBLE
+ * WINDOW ENDS THE PROCESS: status 0, no exception, no crash report, and the next timer
+ * never runs. That is the real rule behind "hide() kills the app", and it is about the
+ * window being the last one and not about it being borderless. The panel is visible at
+ * 78-110ms, well before the adopted window is. The deadline is there so a runtime that
+ * never shows the panel costs a second at startup instead of hanging.
+ */
+async function closeAdopted(adopted, panel) {
+  const deadline = Date.now() + 4000;
+  while (!panel.isVisible() && Date.now() < deadline) {
+    await new Promise((ok) => setTimeout(ok, 25));
+  }
+  adopted.close();
+}
+
 /* Put the panel under the tray icon, right-aligned to it. getBounds is only meaningful
  * once the item has been placed: at construction it reads {x: 8, y: 1106} and at the
  * first show {x: 1008, y: 5}, which is why this is a callback and not read once.
@@ -544,7 +618,10 @@ export async function runSystray(argv = Deno.args) {
    * the traffic lights came from. The *second* one built in the same process is a
    * `LaufeyKeyableWindow` at mask 0: borderless, and still `canBecomeKeyWindow`, which is
    * the NSPanel subclass the AppKit version had to write by hand. So the startup window is
-   * taken and hidden first, and the panel is built second.
+   * taken and closed, and the panel is built second. `deno desktop` points that window at
+   * our own `Deno.serve` address, so left alone it sits there showing the listing: an
+   * 800x628 copy of the panel with traffic lights on it. `closeAdopted` says why closing
+   * is the only thing that disposes of it.
    *
    * The option set is not the obvious one either. `frameless` ALONE IS IGNORED, mask 15; it
    * only bites together with `resizable: false`. `noActivate` is a trap rather than the
@@ -554,7 +631,7 @@ export async function runSystray(argv = Deno.args) {
    * asynchronously and a later setter undoes it: `alwaysOnTop` in the constructor keeps
    * mask 0, `setAlwaysOnTop(true)` called after it drops back to 7.
    */
-  new desktop.BrowserWindow().hide();   // the startup window, adopted and put away
+  const adopted = new desktop.BrowserWindow();   // the startup window, taken off our hands
 
   const panel = new desktop.BrowserWindow({
     width: WIDTH, height: PAD + HEAD + MAX_ROWS * ROW + FOOT + PAD,
@@ -615,6 +692,14 @@ export async function runSystray(argv = Deno.args) {
 
   tray.onclick = () => toggle();
 
+  // Not a line earlier: the panel blurs while this waits, `onblur` runs `close()`, and
+  // `close` reads `open`. Awaiting above that `let` put the read in the temporal dead zone,
+  // and the ReferenceError came out of an event handler, where it is uncaught and ends the
+  // process. Launched from a terminal the blur never arrived and it looked fine; launched
+  // by LaunchServices, which is how `ccx systray` starts it, the app died at ~300ms every
+  // time.
+  await closeAdopted(adopted, panel);
+
   /* Redraw the menu bar dots, if what they would say has changed.
    *
    * The states in rank order are the whole of the icon, so comparing that list is exactly
@@ -630,7 +715,7 @@ export async function runSystray(argv = Deno.args) {
     const png = await iconPng(states);
     if (key !== drawn) return;
     tray.setIcon(png);
-    untemplate();            // every new image arrives marked as a template; see above
+    recolor(() => key !== drawn);   // it arrives marked as a template; see above
   }
 
   function redraw() {
