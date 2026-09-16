@@ -3,6 +3,10 @@ set -euo pipefail
 IFS=$'\n\t'
 
 APP=ccx.app
+LABEL=net.fserb.ccx
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+INNER="$ROOT/$APP/Contents/MacOS/laufey_webview"
 
 build() {
   local tmp
@@ -17,6 +21,79 @@ JS
 
 clean() {
   rm -rf "$APP"
+}
+
+# deno test needs --ext js for the same reason the build does: `ccx` has no
+# extension, so anything that reads it types it as TypeScript.
+test() {
+  deno test -A --ext js "$ROOT/ccx_test.js" "$@"
+}
+
+check() {
+  deno check "$ROOT"/*.js
+}
+
+# The job launchd runs is `open`, never the inner binary: LaunchServices is what
+# detaches the tray (ppid=1, tty=??) and that is the only launch path that has
+# been tested. `open -W` blocks for the life of the app, so KeepAlive waits on
+# the app rather than relaunching in a loop.
+install() {
+  [[ -x "$INNER" ]] || build
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by \`./task install\`. Edit ./task and reinstall, not this file. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/open</string>
+		<string>-W</string>
+		<string>-a</string>
+		<string>$ROOT/$APP</string>
+		<string>--args</string>
+		<string>systray</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- open hands its own environment to the app, and the app shells out
+		     to bare tmux and ps, which a login PATH does not have. -->
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>$HOME</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- open's own stderr only; the app's stdout goes to LaunchServices. -->
+	<key>StandardOutPath</key>
+	<string>$HOME/Library/Logs/ccx.log</string>
+	<key>StandardErrorPath</key>
+	<string>$HOME/Library/Logs/ccx.log</string>
+</dict>
+</plist>
+PLISTEOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "$LABEL loaded from $PLIST"
+}
+
+# bootout kills `open`, not the app: LaunchServices detached it, so it is not in
+# launchd's process group. The tray has to be stopped by hand.
+uninstall() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  pkill -f "$INNER" 2>/dev/null || true
+  echo "$LABEL unloaded and removed"
 }
 
 function help {
