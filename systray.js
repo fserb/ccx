@@ -45,6 +45,34 @@ const TOGGLE_GAP = 250;     // how long a close is remembered, so the click that
 // Carbon keeps a raw pointer, so a collected callback is a crash later, not an error now.
 let HOTKEY_HANDLER = null;
 
+/* Register the hotkey. `fn` is SCHEDULED and never called in the handler, and that is the
+ * whole of what makes the hotkey work rather than kill the app.
+ *
+ * Carbon runs the handler on the AppKit main thread. Deno runs an UnsafeCallback invoked
+ * from a foreign thread on its own JS thread and BLOCKS THE CALLER until it returns. The
+ * READING calls go the other way: `tray.getBounds()` is `dispatch_sync` onto the main
+ * queue (so is `panel.isVisible()`, and so is every other getter), which blocks the JS
+ * thread until the main thread runs it. So a `fn()` here is a deadlock on the first
+ * `tray.getBounds()` inside `show()`: main waits for JS, JS waits for main, and the app is
+ * gone for good with no panel, no response to a click, no exception and no crash report.
+ * Read off `sample` on a frozen one: main in DispatchEventToHandlers ->
+ * _dispatch_semaphore_wait_slow, the JS thread in laufey_common::GetTrayIconBoundsMac ->
+ * __DISPATCH_WAIT_FOR_QUEUE__. Measured in a built probe with the callback pushed onto the
+ * main queue by `dispatch_async_f`: calling `getBounds()` inside it froze both threads at
+ * the call and the 200ms heartbeat stopped in the same millisecond, while scheduling
+ * returned from the handler in 1ms, read the bounds 2ms later and left the poll ticking.
+ * The writing calls (`setPosition`, `focus`, `setSize`, `executeJs`, `setIcon`) are
+ * `dispatch_async` and would have been safe, which is why this looks like it should work.
+ *
+ * `setTimeout` is enough because the body already runs on the JS thread: it turns the
+ * AppKit work into an ordinary task that starts once the handler has returned and the main
+ * thread is free again. A MICROTASK IS NOT ENOUGH, so this may not become an `await` or an
+ * async handler: deno_core runs the microtask checkpoint before it releases the foreign
+ * thread, measured at 200.1ms of blocked main thread for a `.then()` doing 200ms of work
+ * against 0.1ms for this. It is also what the tray's own click gets for nothing, and why
+ * `toggle()` is safe from there and not from here: a click arrives as an event on a
+ * channel that the JS event loop drains, with no main thread waiting on it.
+ */
 function registerHotkey(fn) {
   if (!MAC) return "no global hotkey outside macOS";
   let last = 0;
@@ -54,7 +82,7 @@ function registerHotkey(fn) {
       const now = performance.now();
       if (now - last > REPEAT_GAP) {   // a held key repeats; one press is one toggle
         last = now;
-        fn();
+        setTimeout(fn, 0);             // never fn(): the main thread is waiting on this
       }
       return 0;
     },
