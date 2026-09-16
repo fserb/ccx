@@ -2,7 +2,7 @@
 
 import {
   discover, fuzzy, jump, kittyWindowTitle, loadBell, NUMBERS, ON_EXIT, PALETTE, play,
-  raiseTarget, rank, ringer, sessionRecords, sh, soundBytes, SORTS, STATE, StateClock,
+  raiseTarget, rank, ringer, sessionRecords, sh, soundBytes, SORTS, stateOf, StateClock,
   tmuxWindowName,
 } from "./claudes.js";
 
@@ -158,7 +158,7 @@ function headerLine(lay, cols) {
 }
 
 function rowLine(inst, n, cursor, lay, cols, needle) {
-  const state = STATE[inst.state] ?? STATE.free;
+  const state = stateOf(inst);
   return tableLine([
     [{t: n < NUMBERS.length ? NUMBERS[n] : " ", c: PALETTE.dim}],
     [{t: state.label, c: state.color}],
@@ -257,8 +257,22 @@ function view() {
   };
 }
 
-function reload() {
-  app.instances = app.clock.update(discover());
+/* One poll. Async now, so the input loop is not held for the ~59ms discover() costs.
+ *
+ * The guard is what async buys and also what it costs: the 1.5s interval no longer waits
+ * for the poll it started, so a discover that outran its interval would stack up until one
+ * of them won the race and put a stale listing on the screen. Skipping instead means a slow
+ * poll drops the next tick rather than queueing it.
+ */
+let polling = false;
+async function reload() {
+  if (polling) return;
+  polling = true;
+  try {
+    app.instances = app.clock.update(await discover());
+  } finally {
+    polling = false;
+  }
   if (app.clock.woke.length) play();           // one sound per pass, not one per instance
   refresh();
 }
@@ -285,12 +299,17 @@ function move(delta) {
   app.cursorPid = app.ranked[app.cursor].pid;
 }
 
-function jumpRow(n) {
+// Not awaited by its caller: enter does not close the app, so the jump happens while the
+// TUI keeps drawing, and a toast is how a failure gets back to the screen either way.
+async function jumpRow(n) {
   if (n < 0 || n >= app.ranked.length) return;
   app.cursor = n;                              // so the cursor shows what was taken
   app.cursorPid = app.ranked[n].pid;
-  const err = jump(app.ranked[n]);
-  if (err) toast(err);
+  const err = await jump(app.ranked[n]);
+  if (err) {
+    toast(err);
+    draw();                                    // the draw for this keystroke already ran
+  }
 }
 
 function toast(text) {
@@ -412,7 +431,7 @@ async function cmdUi() {
     Deno.exit(2);
   }
   await loadBell();                  // play() is a no-op until this runs, and a poll cannot await
-  restores = [tmuxWindowName("ccx"), kittyWindowTitle("ccx")];
+  restores = [tmuxWindowName("ccx"), await kittyWindowTitle("ccx")];
   enter();
   for (const sig of ["SIGTERM", "SIGHUP"]) Deno.addSignalListener(sig, quit);
   Deno.addSignalListener("SIGWINCH", () => {
@@ -420,10 +439,10 @@ async function cmdUi() {
     refresh();
     draw();
   });
-  reload();
+  await reload();
   draw();
-  setInterval(() => {
-    reload();
+  setInterval(async () => {
+    await reload();
     draw();
   }, 1500);
   const buf = new Uint8Array(4096);
@@ -452,28 +471,40 @@ const SAMPLE = [
   ["wait", 42, "~/prj/ccx", "port ccx from python to deno"],
   ["busy", 197, "~/prj/wrangler", "wrangler config for the edge worker"],
   ["free", 8100, "~/web/blob2", ""],
-  ["wait", 7, "~/blah", "reorganize the skills tree"],
+  // a dialog is up, so this one draws the ◆ rather than the ●; same state, same sort
+  ["wait", 7, "~/blah", "reorganize the skills tree", "edit ~/blah/skills/SKILLS.md"],
   ["busy", 1500, "~/prj/ccx:2", "inline the bell and play it from memory"],
   // two-cell characters, so a width that counted code units shows up here as a summary
   // column one row out of line with the others
   ["wait", 320, "~/prj/kanji", "日本語のタイトル in a session title"],
+  // over both crops, so the hard cut at 26 and 50 is visible in a frame instead of implied
+  ["busy", 60, "~/prj/a-very-long-directory-name-that-does-not-fit",
+    "a summary that is definitely longer than fifty display cells in total"],
 ];
 
 function sample() {
-  // duck-typed: rank() and render() read shortPath, summary, state, since, pid and age
-  return SAMPLE.map(([state, ago, shortPath, summary], n) => ({
-    pid: 1000 + n, state, summary, shortPath, since: NOW - ago,
+  // duck-typed: rank() and render() read shortPath, summary, state, since, pid, age and
+  // asking, which is what picks the ◆
+  return SAMPLE.map(([state, ago, shortPath, summary, asking = ""], n) => ({
+    pid: 1000 + n, state, summary, shortPath, asking, since: NOW - ago,
     age: ago < 60 ? `${ago}s`
       : ago < 3600 ? `${Math.floor(ago / 60)}m` : `${Math.floor(ago / 3600)}h`,
   }));
 }
 
-// ccx --snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast]
+// ccx --snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast] [cursor=N] [offset=N]
+//
+// cursor= and offset= exist so the two things the default frame cannot show are reachable:
+// the cursor row's fill, and a table scrolled down. Both are colour, so they are the one
+// case where `plain` throws away what you came to look at.
 function cmdSnapshot(...args) {
   let cols = 100, height = 14, plain = false, filter = "", rows = sample(), toast = null;
+  let cursor = 0, offset = 0;
   for (const a of args) {
     const wh = /^(\d+)x(\d+)$/.exec(a);
+    const nm = /^(cursor|offset)=(\d+)$/.exec(a);
     if (wh) [cols, height] = [Number(wh[1]), Number(wh[2])];
+    else if (nm) (nm[1] === "cursor" ? cursor = Number(nm[2]) : offset = Number(nm[2]));
     else if (a === "plain") plain = true;
     else if (a === "empty") rows = [];
     else if (a === "toast") toast = "pid 1000 is not inside tmux; nothing to focus";
@@ -484,16 +515,16 @@ function cmdSnapshot(...args) {
   const ranked = rank(rows, needle, SORTS[0]);
   const frame = render({
     ranked, total: rows.length, waiting: rows.filter((i) => i.state === "wait").length,
-    filter, needle, sort: SORTS[0], cursor: 0, offset: 0, toast, cols, height,
+    filter, needle, sort: SORTS[0], cursor, offset, toast, cols, height,
   }).join("\n");
   console.log(plain ? frame.replaceAll(SGR, "") : frame);
 }
 
 // --------------------------------------------------------------------------------- cli
 
-function cmdList() {
-  for (const i of new StateClock().update(discover())) {
-    console.log(`${STATE[i.state].label.padEnd(6)} ${i.age.padStart(4)}  ` +
+async function cmdList() {
+  for (const i of new StateClock().update(await discover())) {
+    console.log(`${stateOf(i).label.padEnd(6)} ${i.age.padStart(4)}  ` +
       `${i.shortPath.padEnd(30)} ${i.summary}`);
   }
 }
@@ -502,25 +533,25 @@ async function cmdDoctor() {
   await loadBell();                  // soundBytes() is empty until the gzip has been read
   console.log(`TMUX=${Deno.env.get("TMUX") ?? "(none)"}  ` +
     `KITTY_WINDOW_ID=${Deno.env.get("KITTY_WINDOW_ID") ?? "(none)"}`);
-  const pass = sh("tmux", "show", "-gv", "allow-passthrough").trim();
+  const pass = (await sh("tmux", "show", "-gv", "allow-passthrough")).trim();
   console.log(`tmux allow-passthrough: ${pass}`);
   // the two per-platform pieces, so a box that jumps but stays silent says which
   console.log(`platform ${Deno.build.os}  bell ${ringer()}  ` +
     `sound ${soundBytes().length}B of wav, straight from memory`);
   const records = sessionRecords();
-  for (const i of discover()) {
+  for (const i of await discover()) {
     const rec = records[i.pid] ?? {};
     console.log(`  pid ${i.pid} pane ${i.pane || "-"} session ${i.session || "-"} ` +
       `state ${i.state || "?"} record ${rec.status ?? "(none)"}` +
-      `${rec.waitingFor ? "/" + rec.waitingFor : ""} ` +
-      `match ${i.match ?? "(unresolved)"} raise ${raiseTarget(i)}`);
+      `${i.asking ? "/" + i.asking : ""} ` +
+      `match ${i.match ?? "(unresolved)"} raise ${await raiseTarget(i)}`);
   }
 }
 
-function cmdFocus(pid) {
-  for (const i of discover()) {
+async function cmdFocus(pid) {
+  for (const i of await discover()) {
     if (String(i.pid) !== pid) continue;
-    const err = jump(i);
+    const err = await jump(i);
     if (!err) return;
     console.error(err);
     Deno.exit(1);
@@ -571,7 +602,8 @@ const COMMANDS = {
 
 function usage() {
   console.error("usage: ccx [list | doctor | focus <pid> | systray | " +
-    "--snapshot [<cols>x<rows>] [plain]]");
+    "--snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast] " +
+    "[cursor=N] [offset=N]]");
   Deno.exit(2);
 }
 

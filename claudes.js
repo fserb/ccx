@@ -12,11 +12,28 @@ const BYTES = new TextEncoder();
 
 // ------------------------------------------------------------------ the listing
 
-// No timeout. The Python passed timeout=4 to subprocess.run; Deno's outputSync has no
-// equivalent, and every caller here is on the UI thread, so a tmux that never returns
-// hangs the app rather than dropping one poll. Left as is because the async rewrite is
-// the same change as moving discover() off the UI thread, which is its own TODO.
-export function sh(...args) {
+// Run a command, or "" if it fails. The timeout is the point: one tmux that never returns
+// used to hang the whole UI, since every caller is on the same task as the input loop.
+// AbortSignal kills the child with SIGTERM, which lands here as code 143, so a timeout
+// needs no branch of its own: it is already a non-zero exit (measured: 307ms for a 300ms
+// signal against `sleep 5`).
+const TIMEOUT = 4000;
+export async function sh(...args) {
+  try {
+    const r = await new Deno.Command(args[0], {args: args.slice(1), stdin: "null",
+      signal: AbortSignal.timeout(TIMEOUT)}).output();
+    return r.code === 0 ? UTF8.decode(r.stdout) : "";
+  } catch {
+    return "";
+  }
+}
+
+// The same thing, synchronous and with no timeout, for the ON_EXIT path ONLY.
+//
+// quit() runs the restores and then calls Deno.exit, which does not wait for a promise, so
+// an exit handler that awaited would be killed before its tmux command ran. Nothing in the
+// poll loop may use this: outputSync has no timeout and that is the bug above.
+function shSync(...args) {
   try {
     const r = new Deno.Command(args[0], {args: args.slice(1), stdin: "null"}).outputSync();
     return r.code === 0 ? UTF8.decode(r.stdout) : "";
@@ -36,6 +53,7 @@ export class Instance {
     this.path = "";
     this.summary = "";
     this.state = "";          // "" until StateClock fills it in
+    this.asking = "";         // the record's waitingFor: a dialog is up, and which one
     this.statusSince = 0;     // epoch of the record's last status change, 0 without one
     this.lastWrite = 0;       // epoch claude last wrote to its session log
     this.since = 0;           // epoch this instance entered its current state
@@ -252,9 +270,9 @@ export class StateClock {
 const IS_CLAUDE = /(^|\/)claude(\s|$)|\.claude\/local\/.*cli\.js/;
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(.*)$/;
 
-function processes() {
+async function processes() {
   const table = new Map();
-  for (const line of sh("ps", "-axo", "pid=,ppid=,command=").split("\n")) {
+  for (const line of (await sh("ps", "-axo", "pid=,ppid=,command=")).split("\n")) {
     const m = PS_LINE.exec(line);
     if (m) table.set(Number(m[1]), [Number(m[2]), m[3]]);
   }
@@ -279,13 +297,31 @@ function kittyOwner(pid, procs) {
   return [pid, 0];
 }
 
-function tmuxRows(subcommand, fields, ...extra) {
-  const fmt = fields.map((f) => `#{${f}}`).join("\t");
-  const out = sh("tmux", subcommand, ...extra, "-F", fmt);
-  return out.split("\n").filter((l) => l).map((line) => {
+// Several `-F` listings out of ONE tmux invocation. tmux takes `;`-separated commands in
+// a single call, which is one process instead of one per listing; each spec's rows are
+// tagged with its own key so the interleaved output can be split apart again.
+//
+// The cost is that they now share an exit status: a tmux that is not running loses both
+// listings at once, which is what it did anyway. `sh()` returns "" on failure, so a lost
+// listing is an empty table and not a throw.
+async function tmuxTables(specs) {
+  const argv = [];
+  for (const [key, subcommand, fields, ...extra] of specs) {
+    if (argv.length) argv.push(";");
+    const fmt = fields.map((f) => `#{${f}}`).join("\t");
+    argv.push(subcommand, ...extra, "-F", `${key}\t${fmt}`);
+  }
+  const out = await sh("tmux", ...argv);
+  const tables = Object.fromEntries(specs.map(([key]) => [key, []]));
+  for (const line of out.split("\n")) {
+    if (!line) continue;
     const parts = line.split("\t");
-    return Object.fromEntries(fields.map((f, n) => [f, parts[n] ?? ""]));
-  });
+    const spec = specs.find(([key]) => key === parts[0]);
+    if (!spec) continue;
+    tables[parts[0]].push(
+      Object.fromEntries(spec[2].map((f, n) => [f, parts[n + 1] ?? ""])));
+  }
+  return tables;
 }
 
 function capture(pane, lines = 40) {
@@ -303,7 +339,7 @@ const BANNER = /Claude Code v\d/;      // the startup banner, which /clear repai
 // busy (a turn is running), free (nothing in the session), or wait (yours). Judge from
 // the BOTTOM of the screen: a marker matched anywhere in the scrollback misreads a pane
 // that merely discusses it, which is how the pane writing this reported the wrong state.
-function paneState(text) {
+export function paneState(text) {
   const lines = text.split("\n").filter((l) => l.trim());
   if (!lines.length) return "";        // nothing was read; the caller keeps the previous state
   if (lines.slice(-8).some((l) => SPINNER.test(l))) return "busy";
@@ -319,24 +355,43 @@ function paneState(text) {
 // "Claude Code" is the literal default the title falls back to before a session has a
 // title of its own, not a title. The leading glyph is Claude's, and under tmux it is
 // always the same one: it detects the multiplexer and stops animating it.
-function summaryOf(title) {
+export function summaryOf(title) {
   const text = title.replace(/^[✳✶✻✽* ·]+/, "").trim();
   return text === "Claude Code" ? "" : text;
 }
 
-export function discover() {
-  const procs = processes();
+// Every running claude, with where it is and what it is doing.
+//
+// Async because it runs on the same task as the input loop every 1.5s: the `ps` and the
+// tmux listing now overlap each other instead of adding up, and the screen scrapes for
+// the instances that have no record all run at once rather than one after another.
+export async function discover() {
+  const [procs, tmux] = await Promise.all([
+    processes(),
+    tmuxTables([
+      ["p", "list-panes", ["session_name", "window_index", "pane_index",
+        "pane_id", "pane_pid", "pane_current_path", "pane_title"], "-a"],
+      ["c", "list-clients", ["client_tty", "client_pid", "client_session"]],
+    ]),
+  ]);
   const records = sessionRecords();
-  const panes = tmuxRows("list-panes", ["session_name", "window_index", "pane_index",
-    "pane_id", "pane_pid", "pane_current_path", "pane_title"], "-a");
-  const clients = tmuxRows("list-clients", ["client_tty", "client_pid", "client_session"]);
+  const [panes, clients] = [tmux.p, tmux.c];
   const paneByPid = new Map(panes.map((p) => [Number(p.pane_pid), p]));
   const clientBySession = new Map(clients.map((c) => [c.client_session, c]));
 
   const found = [];
+  const scrape = [];              // [instance, pane_id] for the ones with no record
   for (const [pid, [, cmd]] of procs) {
     if (!IS_CLAUDE.test(cmd)) continue;
     const rec = records[pid] ?? {};
+    // `claude -p` is a claude by its argv and by its record, and it walks up to whatever
+    // pane launched it, so without this it is a second row for a session that has one.
+    // `kind` does NOT separate them, which is what this looked like it would be:
+    // measured on 2.1.273, both say `interactive` and `entrypoint` is what differs, `cli`
+    // for a TUI against `sdk-cli` for -p. Written as "not cli" rather than "not sdk-cli"
+    // so an entrypoint nobody has seen yet is left out rather than let in; a record-less
+    // instance still passes, since that is the fallback-scrape path
+    if (rec.entrypoint && rec.entrypoint !== "cli") continue;
     const [state, since] = recordState(rec);
     let pane = null, cur = pid;
     for (let n = 0; n < 12; n++) {                 // walk up to the owning pane
@@ -351,13 +406,14 @@ export function discover() {
     if (!pane) {
       // nothing to focus without a pane, but the record still knows the rest
       found.push(new Instance({pid, summary: title || cmd, path: rec.cwd ?? "",
-        state, statusSince: since}));
+        state, asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
+        statusSince: since}));
       continue;
     }
     const client = clientBySession.get(pane.session_name) ?? {};
     const cpid = client.client_pid ?? "";
     const [child, kitty] = cpid ? kittyOwner(Number(cpid), procs) : [0, 0];
-    found.push(new Instance({
+    const inst = new Instance({
       pid,
       pane: pane.pane_id,
       session: pane.session_name,
@@ -368,14 +424,21 @@ export function discover() {
       // claude is in *now*, where pane_title still shows the one before a /clear.
       // pane_title is what is left when there is no record, as with state
       summary: Object.keys(rec).length ? title : summaryOf(pane.pane_title),
-      state: state || paneState(capture(pane.pane_id)),
+      state,                       // "" with no record; the scrape below fills it in
+      asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
       statusSince: since,
       lastWrite: state ? 0 : lastWrite(pane.pane_current_path),
       clientTty: client.client_tty ?? "",
       kittyPid: cpid ? String(child) : "",
       kittyProc: kitty ? String(kitty) : "",
-    }));
+    });
+    found.push(inst);
+    if (!state) scrape.push([inst, pane.pane_id]);
   }
+  // all at once: these are the instances Claude Code wrote no record for, and serially
+  // they were the whole cost of a poll on a box with several of them
+  await Promise.all(scrape.map(async ([inst, pane]) =>
+    inst.state = paneState(await capture(pane))));
   tagTabs(found);
   return found.sort((a, b) => byCodePoint(a.shortPath, b.shortPath) || a.pid - b.pid);
 }
@@ -456,9 +519,27 @@ export function rank(instances, needle = "", sort = "state") {
 // paints "⏵⏵ auto mode on" with, and reads as the same yellow.
 export const STATE = {
   wait: {label: "● wait", color: "#ffd500"},
+  ask: {label: "◆ wait", color: "#ffd500"},
   busy: {label: "◐ busy", color: "#93aeaa"},
   free: {label: "◌ free", color: "#626262"},
 };
+
+/* The STATE entry a row draws with.
+ *
+ * `ask` is a fourth glyph and not a fourth state: it sorts, counts and rings as `wait`,
+ * and the record's `waitingFor` is the only thing that picks it. What it separates is the
+ * half of `wait` that a list cannot otherwise show, a dialog holding the screen against
+ * the turn merely being over, without splitting the one question the list answers, which
+ * is whether this one wants you.
+ *
+ * ◆ U+25C6 is East Asian Ambiguous like ●, ◐ and ◌, so kitty draws it narrow and
+ * `◆ wait` is the same 6 cells as `● wait`; a Wide glyph here would push the whole row
+ * one cell out.
+ */
+export function stateOf(inst) {
+  if (inst.state === "wait" && inst.asking) return STATE.ask;
+  return STATE[inst.state] ?? STATE.free;
+}
 
 // Out of ~/.config/kitty/kitty.conf, so the tools look like the terminal they run in:
 // #ceaadf is color13, #b8a0be is color5.
@@ -669,9 +750,9 @@ export function sendKitty(command, payload, tty = null) {
 // `single_instance` or `kitty @ launch --type=os-window` would break that and this would
 // raise whichever of them niri lists first. Nothing else on Wayland can do better without
 // kitty telling us which of its windows is where, which it cannot.
-function niriWindow(pid) {
+async function niriWindow(pid) {
   try {
-    for (const w of JSON.parse(sh("niri", "msg", "--json", "windows") || "[]")) {
+    for (const w of JSON.parse(await sh("niri", "msg", "--json", "windows") || "[]")) {
       if (String(w.pid) === String(pid)) return w.id;
     }
   } catch {
@@ -683,39 +764,40 @@ function niriWindow(pid) {
 // Bring the terminal's own window to the front. The per-platform half of the jump: on
 // Wayland an app cannot raise itself without a recent interaction, so the compositor
 // has to be asked by its own window id.
-function raiseWindow(inst) {
+async function raiseWindow(inst) {
   if (MAC) {
-    sh("open", "-a", "kitty");
+    await sh("open", "-a", "kitty");
     return;
   }
   if (!inst.kittyProc) return;
-  const wid = niriWindow(inst.kittyProc);
-  if (wid !== null) sh("niri", "msg", "action", "focus-window", "--id", String(wid));
+  const wid = await niriWindow(inst.kittyProc);
+  if (wid !== null) await sh("niri", "msg", "action", "focus-window", "--id", String(wid));
 }
 
 // What raiseWindow() would do with this instance, for `ccx doctor` to print.
-export function raiseTarget(inst) {
+export async function raiseTarget(inst) {
   if (MAC) return "open -a kitty";
   if (!inst.kittyProc) return "(no kitty ancestor)";
-  const wid = niriWindow(inst.kittyProc);
+  const wid = await niriWindow(inst.kittyProc);
   return wid !== null ? `niri ${wid}` : `(kitty ${inst.kittyProc} not in niri)`;
 }
 
 // Focus the instance. Returns an error message, or null when it worked.
-export function jump(inst) {
+export async function jump(inst) {
   if (!inst.pane) return `pid ${inst.pid} is not inside tmux; nothing to focus`;
-  if (inst.clientTty) {
-    sh("tmux", "switch-client", "-c", inst.clientTty, "-t", inst.session);
-  } else if (Deno.env.get("TMUX")) {
-    sh("tmux", "switch-client", "-t", inst.session);
-  }
-  sh("tmux", "select-window", "-t", `${inst.session}:${inst.window}`);
-  sh("tmux", "select-pane", "-t", inst.pane);
+  // one tmux call: the three commands must land in this order, and `;` is how tmux is
+  // told that without paying for three processes
+  const client = inst.clientTty
+    ? ["switch-client", "-c", inst.clientTty, "-t", inst.session, ";"]
+    : Deno.env.get("TMUX") ? ["switch-client", "-t", inst.session, ";"] : [];
+  await sh("tmux", ...client,
+    "select-window", "-t", `${inst.session}:${inst.window}`, ";",
+    "select-pane", "-t", inst.pane);
   if (inst.match) {
     // the client's own tty, so this works with no controlling terminal of our own
     sendKitty("focus-window", {match: inst.match}, inst.clientTty || null);
   }
-  raiseWindow(inst);
+  await raiseWindow(inst);
   return null;
 }
 
@@ -732,16 +814,18 @@ export const ON_EXIT = [];
 export function tmuxWindowName(name) {
   const pane = Deno.env.get("TMUX_PANE");
   if (!pane) return () => {};
-  const was = sh("tmux", "display-message", "-p", "-t", pane,
+  // shSync throughout, not sh: the restore below runs from ON_EXIT, which quit() calls
+  // immediately before Deno.exit, and Deno.exit does not wait for a promise
+  const was = shSync("tmux", "display-message", "-p", "-t", pane,
     "#{automatic-rename}\t#{window_name}").trim();
-  sh("tmux", "rename-window", "-t", pane, name);
+  shSync("tmux", "rename-window", "-t", pane, name);
 
   const restore = () => {
     const [auto, before] = [was.slice(0, was.indexOf("\t")), was.slice(was.indexOf("\t") + 1)];
     if (auto === "1" || !before) {
-      sh("tmux", "set-window-option", "-t", pane, "automatic-rename", "on");
+      shSync("tmux", "set-window-option", "-t", pane, "automatic-rename", "on");
     } else {
-      sh("tmux", "rename-window", "-t", pane, before);
+      shSync("tmux", "rename-window", "-t", pane, before);
     }
   };
   ON_EXIT.push(restore);
@@ -754,12 +838,12 @@ export function tmuxWindowName(name) {
 // Name our own kitty window for as long as the app runs. Target the client's kitty
 // ancestor, never KITTY_WINDOW_ID: inside a pane that is inherited from the environment
 // the tmux SERVER started in and can name a window that closed long ago.
-export function kittyWindowTitle(name) {
+export async function kittyWindowTitle(name) {
   let target = {};
   if (Deno.env.get("TMUX")) {
-    const pid = sh("tmux", "display-message", "-p", "#{client_pid}").trim();
+    const pid = (await sh("tmux", "display-message", "-p", "#{client_pid}")).trim();
     if (!pid) return () => {};        // no client attached, so no window to name
-    target = {match: `pid:${kittyOwner(Number(pid), processes())[0]}`};
+    target = {match: `pid:${kittyOwner(Number(pid), await processes())[0]}`};
   }
   sendKitty("set-window-title", {...target, title: name});
 

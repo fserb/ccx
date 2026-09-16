@@ -8,7 +8,7 @@
  */
 
 import {
-  discover, jump, loadBell, NUMBERS, PALETTE, play, rank, StateClock, STATE, MAC, fuzzy,
+  discover, jump, loadBell, NUMBERS, PALETTE, play, rank, StateClock, stateOf, MAC, fuzzy,
 } from "./claudes.js";
 import {iconPng} from "./icon.js";
 
@@ -230,6 +230,7 @@ function recolor(stale, tries = 0) {
 class Model {
   constructor(redraw, close, quit) {
     this.clock = new StateClock();
+    this.polling = false;
     this.instances = [];
     this.rows = [];
     this.filter = "";
@@ -242,8 +243,18 @@ class Model {
 
   // ---- the listing
 
-  poll() {
-    this.instances = this.clock.update(discover());
+  /* One poll. discover() is async, so the interval no longer waits for the poll it
+   * started; the guard drops the next tick rather than letting two land out of order and
+   * paint the older listing. This is the thing that runs all day, so it also owns the bell.
+   */
+  async poll() {
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      this.instances = this.clock.update(await discover());
+    } finally {
+      this.polling = false;
+    }
     if (this.clock.woke.length) play();   // busy -> wait: a turn ended or a prompt is up
     this.refresh();
   }
@@ -320,7 +331,7 @@ class Model {
       note: this.note(),
       hints: HINTS,
       rows: this.rows.slice(0, MAX_ROWS).map((inst, n) => {
-        const state = STATE[inst.state] ?? STATE.free;
+        const state = stateOf(inst);
         return {
           num: n < NUMBERS.length ? NUMBERS[n] : " ",
           label: state.label,
@@ -372,10 +383,10 @@ class Model {
    * you are already sitting in. A jump that failed says so instead of closing, since a
    * panel that vanished having done nothing is indistinguishable from one that worked.
    */
-  jumpRow(row) {
+  async jumpRow(row) {
     if (!(row >= 0 && row < Math.min(this.rows.length, MAX_ROWS))) return;
     this.selected = this.rows[row].pid;
-    const err = jump(this.rows[row]);
+    const err = await jump(this.rows[row]);
     if (err) {
       this.error = err;
       this.redraw();
@@ -762,7 +773,7 @@ export async function runSystray(argv = Deno.args) {
   const err = registerHotkey(() => toggle());
   if (err) console.error(`${err}; the menu bar icon still works`);
 
-  model.poll();
+  await model.poll();
   setInterval(() => model.poll(), POLL);
   // the only way to look at the panel from a script: clicking the icon needs a mouse and
   // pressing the hotkey needs a person
