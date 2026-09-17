@@ -949,7 +949,8 @@ const COMMANDS = {
 };
 
 // one help line each: a [syntax, what it does] pair is drawn as a column, a string as it
-// is. The paragraphs are broken by hand, so nothing here has to measure the terminal
+// is, and an empty syntax continues the line above. --snapshot and --resolve are left out
+// of it, they exist for the tests
 const HELP = [
   "usage: ccx <command> [args]",
   "",
@@ -962,14 +963,8 @@ const HELP = [
   ["  systray", "the menu bar app, needs ./task build"],
   ["  help", "this"],
   "",
-  "a target is a pid, a session name, `all`, or a fuzzy match on the name or the path,",
-  "and `send` takes a comma-separated list of them",
-  "",
-  "in the TUI 1-0 and enter jump, esc quits, ^s changes the sort, ^t is the chat view,",
-  "and any other key filters the list",
-  "",
-  "two more belong to the tests: --snapshot [chat] [<cols>x<rows>] [plain] [/<filter>]",
-  "[empty] [toast] [cursor=N] [offset=N], and --resolve <target>[,<target>...] [self=N]",
+  ["  <target>", "a pid, a session name, `all`, or part of either"],
+  ["", "`send` takes a comma-separated list of them"],
 ];
 
 // colour only into a terminal, so a pipe carries the words and nothing else. paint() ends
