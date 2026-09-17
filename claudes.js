@@ -1,46 +1,7 @@
-// Every running Claude Code instance, and how to focus one. No UI here: discover() is the
-// listing, jump() is the action. See `## How the mapping works` in CLAUDE.md.
+// Every running Claude Code instance and what it is doing. No UI here, and no focusing
+// either: discover() is the listing, jump() in jump.js is the action.
 
-export const HOME = Deno.env.get("HOME") ?? "";
-export const MAC = Deno.build.os === "darwin";
-
-const UTF8 = new TextDecoder();
-// Python compares strings by code point. localeCompare collates instead, which puts
-// case and punctuation in a different order, so the `path` sort would not match.
-const byCodePoint = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const BYTES = new TextEncoder();
-
-// ------------------------------------------------------------------ the listing
-
-// Run a command, or "" if it fails. The timeout is the point: one tmux that never returns
-// used to hang the whole UI, since every caller is on the same task as the input loop.
-// AbortSignal kills the child with SIGTERM, which lands here as code 143, so a timeout
-// needs no branch of its own: it is already a non-zero exit (measured: 307ms for a 300ms
-// signal against `sleep 5`).
-const TIMEOUT = 4000;
-export async function sh(...args) {
-  try {
-    const r = await new Deno.Command(args[0], {args: args.slice(1), stdin: "null",
-      signal: AbortSignal.timeout(TIMEOUT)}).output();
-    return r.code === 0 ? UTF8.decode(r.stdout) : "";
-  } catch {
-    return "";
-  }
-}
-
-// The same thing, synchronous and with no timeout, for the ON_EXIT path ONLY.
-//
-// quit() runs the restores and then calls Deno.exit, which does not wait for a promise, so
-// an exit handler that awaited would be killed before its tmux command ran. Nothing in the
-// poll loop may use this: outputSync has no timeout and that is the bug above.
-function shSync(...args) {
-  try {
-    const r = new Deno.Command(args[0], {args: args.slice(1), stdin: "null"}).outputSync();
-    return r.code === 0 ? UTF8.decode(r.stdout) : "";
-  } catch {
-    return "";
-  }
-}
+import {byCodePoint, HOME, sh, UTF8} from "./sh.js";
 
 export class Instance {
   constructor(fields) {
@@ -54,6 +15,8 @@ export class Instance {
     this.summary = "";
     this.state = "";          // "" until StateClock fills it in
     this.asking = "";         // the record's waitingFor: a dialog is up, and which one
+    this.name = "";           // the session's own name, what a peer addresses it by
+    this.sock = "";           // the record's messagingSocketPath, where peer.js delivers
     this.statusSince = 0;     // epoch of the record's last status change, 0 without one
     this.lastWrite = 0;       // epoch claude last wrote to its session log
     this.since = 0;           // epoch this instance entered its current state
@@ -91,11 +54,8 @@ function projectDir(cwd) {
   return `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}`;
 }
 
-// When claude last wrote a message for this cwd, from its session log's mtime.
-//
-// tmux's `window_activity` looks like the obvious source and is useless: Claude's TUI
-// repaints constantly, so an idle pane still reports activity ~now. The session log is
-// only appended on real messages.
+// When claude last wrote for this cwd, by its session log's mtime. tmux's
+// `window_activity` is useless: the TUI repaints constantly, so an idle pane reports ~now.
 function lastWrite(path) {
   let newest = 0;
   const dir = projectDir(path);
@@ -111,15 +71,14 @@ function lastWrite(path) {
   return newest;
 }
 
-// What Claude Code calls itself, in ~/.claude/sessions/<pid>.json, mapped onto our three.
-// "waiting" is a dialog holding the screen (a permission prompt, /model, an elicitation)
-// and "shell" is idle with a background shell still running; both want you, like "idle".
+// Claude Code's own `status`, in ~/.claude/sessions/<pid>.json, onto our three. "waiting"
+// is a dialog holding the screen, "shell" is idle with a background shell still running;
+// both want you, like "idle".
 const RECORD_STATE = {busy: "busy", waiting: "wait", idle: "wait", shell: "wait"};
 const BIG_LOG = 256 * 1024;
 
-// Claude Code's own view of every live session, keyed by pid. `status` is the state as
-// the process knows it, not as the screen looks, which is the one thing a scrape cannot
-// see: busy stays set while the final message streams out.
+// Every live session as Claude Code knows it, keyed by pid. The state as the process has
+// it, not as the screen looks: busy stays set while the final message streams out.
 export function sessionRecords() {
   const records = {};
   let entries;
@@ -140,10 +99,8 @@ export function sessionRecords() {
   return records;
 }
 
-// [state, epoch it started], or ["", 0] when this pid has no record.
-//
-// A session with nothing in it is free, except when a dialog is up: that one is asking
-// you something, empty or not, which is what an unanswered trust prompt is.
+// [state, epoch it started], or ["", 0] with no record. An empty session is free unless a
+// dialog is up: an unanswered trust prompt wants you, empty or not.
 function recordState(rec) {
   const state = RECORD_STATE[rec.status] ?? "";
   if (!state) return ["", 0];
@@ -152,12 +109,9 @@ function recordState(rec) {
   return [empty ? "free" : state, (rec.statusUpdatedAt ?? 0) / 1000];
 }
 
-// Whether this session ever got an answer, which is what free is not.
-//
-// /clear starts a *new* sessionId, and a fresh one's log holds a handful of bookkeeping
-// lines (~2.6KB) with no assistant entry, so this reads the same as a session that has
-// never been asked anything. Any log past BIG_LOG is a real conversation, which keeps the
-// read small; the log for a session that has said nothing yet does not exist.
+// Whether this session ever got an answer, which is what free is not. /clear starts a
+// *new* sessionId whose log is ~2.6KB of bookkeeping with no assistant entry, reading the
+// same as one never asked anything. Past BIG_LOG it is a real conversation, unread.
 function hasReply(cwd, sessionId) {
   const path = `${projectDir(cwd)}/${sessionId}.jsonl`;
   try {
@@ -168,13 +122,11 @@ function hasReply(cwd, sessionId) {
   }
 }
 
-// The last title line was never further than 34KB from the end of the log, over the 108
-// logs on this machine that carry one, so a tail this size finds it with room to spare.
-const TITLE_TAIL = 256 * 1024;
+const TITLE_TAIL = 256 * 1024;     // titles sit at most 34KB from the end, over 108 logs
 const TITLES = new Map();          // session log -> [size when read, title found]
 
-// Claude's own name for the session, from the transcript. Cached against the log's size
-// and re-read whenever it has grown, which is what carries a /rename onto the next poll.
+// Claude's own name for the session, cached against the log's size and re-read when it
+// has grown, which is what carries a /rename onto the next poll.
 function sessionTitle(cwd, sessionId) {
   if (!cwd || !sessionId) return "";
   const path = `${projectDir(cwd)}/${sessionId}.jsonl`;
@@ -227,11 +179,9 @@ function readTitle(path, size) {
 }
 
 // When each instance entered its current state, and which ones just changed.
-//
-// The record's statusUpdatedAt is the transition itself, so it beats both the poll it was
-// noticed in and the session-log mtime, which is only the seed left for instances with no
-// record. A displayed state that spans two of Claude's own (idle and shell are both wait)
-// keeps the earlier time, since the row did not change.
+// statusUpdatedAt is the transition itself, so it beats the poll that noticed it and the
+// log mtime, which only seeds instances with no record. idle and shell are both wait, so a
+// flip between them keeps the earlier time.
 export class StateClock {
   constructor() {
     this.seen = new Map();
@@ -243,11 +193,8 @@ export class StateClock {
     this.woke = [];
     for (const i of instances) {
       const prev = this.seen.get(i.pid);
-      // a screen we could not read is not a transition: an empty capture-pane, or a tmux
-      // hiccup that drops every pane, would otherwise read as wait and ring for every
-      // running instance at once
-      // 0 and "" are how the fields above say "absent", so these are || and not ??:
-      // ?? only falls back on null, and would take a statusSince of 0 as a real time
+      // a screen we could not read is not a transition: an empty capture would otherwise
+      // read as wait and ring every instance at once. || not ??, since 0 and "" mean absent
       i.state = i.state || (prev ? prev[0] : "wait");
       if (!prev) {                                  // first sight
         i.since = i.statusSince || i.lastWrite || now;
@@ -256,8 +203,7 @@ export class StateClock {
       } else {
         i.since = i.statusSince || now;
       }
-      // only busy -> wait rings, which is a turn ending or a prompt appearing. first sight
-      // is not a transition, so starting up is silent however many are waiting
+      // only busy -> wait rings; first sight is not a transition, so startup is silent
       if (prev && prev[0] === "busy" && i.state === "wait") this.woke.push(i);
       this.seen.set(i.pid, [i.state, i.since]);
     }
@@ -270,7 +216,7 @@ export class StateClock {
 const IS_CLAUDE = /(^|\/)claude(\s|$)|\.claude\/local\/.*cli\.js/;
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(.*)$/;
 
-async function processes() {
+export async function processes() {
   const table = new Map();
   for (const line of (await sh("ps", "-axo", "pid=,ppid=,command=")).split("\n")) {
     const m = PS_LINE.exec(line);
@@ -280,9 +226,9 @@ async function processes() {
 }
 
 // [the ancestor `match pid:` will find, kitty's own pid]. kitty matches a window only by
-// its DIRECT child, and ktmux keeps a wrapper zsh in between, so walk up rather than
-// assuming either shape. No kitty ancestor comes back unchanged and with 0.
-function kittyOwner(pid, procs) {
+// its DIRECT child and ktmux keeps a wrapper zsh in between, so walk up rather than assume
+// either shape. No kitty ancestor comes back unchanged and with 0.
+export function kittyOwner(pid, procs) {
   let cur = pid;
   for (let n = 0; n < 12; n++) {
     const entry = procs.get(cur);
@@ -297,12 +243,9 @@ function kittyOwner(pid, procs) {
   return [pid, 0];
 }
 
-// Several `-F` listings out of ONE tmux invocation. tmux takes `;`-separated commands in
-// a single call, which is one process instead of one per listing; each spec's rows are
-// tagged with its own key so the interleaved output can be split apart again.
-//
-// The cost is that they now share an exit status: a tmux that is not running loses both
-// listings at once, which is what it did anyway. `sh()` returns "" on failure, so a lost
+// Several `-F` listings out of ONE tmux invocation: tmux takes `;`-separated commands in
+// one call (3.8ms against 8.6ms apart), the output interleaves so each spec's rows carry
+// their own key, and they share one exit status. `sh()` returns "" on failure, so a lost
 // listing is an empty table and not a throw.
 async function tmuxTables(specs) {
   const argv = [];
@@ -328,17 +271,15 @@ function capture(pane, lines = 40) {
   return sh("tmux", "capture-pane", "-p", "-t", pane, "-S", `-${lines}`);
 }
 
-// The spinner line, "✽ Working… (16m 29s · ↓ 54.6k tokens)". The parenthetical is drawn a
-// moment after the label, so ~3% of captures during a turn (measured) catch a bare
-// "✽ Beboppin'…" and requiring it read those frames as wait. Anchor on the cycling glyph
-// instead, which also keeps "⏺ Calling chrome-devtools 5 times…" (tool output, not the
-// spinner) out.
+// The spinner, "✽ Working… (16m 29s · ↓ 54.6k tokens)". The parenthetical is drawn a
+// moment after the label, so ~3% of mid-turn captures lack it and requiring it read those
+// frames as wait. The glyph anchor also keeps "⏺ Calling chrome-devtools 5 times…" out,
+// which is tool output and not the spinner.
 const SPINNER = /^\s*[·✢✳✶✻✽*]\s+\S.*…/;
 const BANNER = /Claude Code v\d/;      // the startup banner, which /clear repaints
 
-// busy (a turn is running), free (nothing in the session), or wait (yours). Judge from
-// the BOTTOM of the screen: a marker matched anywhere in the scrollback misreads a pane
-// that merely discusses it, which is how the pane writing this reported the wrong state.
+// busy, free or wait, judged from the BOTTOM of the screen only: a marker matched
+// anywhere in the scrollback misreads a pane that merely displays it.
 export function paneState(text) {
   const lines = text.split("\n").filter((l) => l.trim());
   if (!lines.length) return "";        // nothing was read; the caller keeps the previous state
@@ -350,21 +291,17 @@ export function paneState(text) {
   return "wait";
 }
 
-// The session title as pane_title has it, for instances with no record to read.
-//
-// "Claude Code" is the literal default the title falls back to before a session has a
-// title of its own, not a title. The leading glyph is Claude's, and under tmux it is
-// always the same one: it detects the multiplexer and stops animating it.
+// The session title as pane_title has it, for instances with no record to read. "Claude
+// Code" is the literal default before a session has a title of its own, and the leading
+// glyph is Claude's, always the same one under tmux, which it detects and stops animating.
 export function summaryOf(title) {
   const text = title.replace(/^[✳✶✻✽* ·]+/, "").trim();
   return text === "Claude Code" ? "" : text;
 }
 
-// Every running claude, with where it is and what it is doing.
-//
-// Async because it runs on the same task as the input loop every 1.5s: the `ps` and the
-// tmux listing now overlap each other instead of adding up, and the screen scrapes for
-// the instances that have no record all run at once rather than one after another.
+// Every running claude, with where it is and what it is doing. Async because it shares a
+// task with the input loop: `ps` and the tmux listing overlap instead of adding up, and so
+// do the record-less screen scrapes.
 export async function discover() {
   const [procs, tmux] = await Promise.all([
     processes(),
@@ -384,13 +321,10 @@ export async function discover() {
   for (const [pid, [, cmd]] of procs) {
     if (!IS_CLAUDE.test(cmd)) continue;
     const rec = records[pid] ?? {};
-    // `claude -p` is a claude by its argv and by its record, and it walks up to whatever
-    // pane launched it, so without this it is a second row for a session that has one.
-    // `kind` does NOT separate them, which is what this looked like it would be:
-    // measured on 2.1.273, both say `interactive` and `entrypoint` is what differs, `cli`
-    // for a TUI against `sdk-cli` for -p. Written as "not cli" rather than "not sdk-cli"
-    // so an entrypoint nobody has seen yet is left out rather than let in; a record-less
-    // instance still passes, since that is the fallback-scrape path
+    // `claude -p` walks up to whatever pane launched it, so it is a phantom second row.
+    // `kind` does NOT separate them: on 2.1.273 both say `interactive`, and `entrypoint`
+    // is `cli` for a TUI against `sdk-cli` for -p. "not cli" so an entrypoint nobody has
+    // seen is left out rather than let in; a record-less instance still passes, to scrape
     if (rec.entrypoint && rec.entrypoint !== "cli") continue;
     const [state, since] = recordState(rec);
     let pane = null, cur = pid;
@@ -403,11 +337,10 @@ export async function discover() {
       cur = procs.get(cur)[0];
     }
     const title = sessionTitle(rec.cwd ?? "", rec.sessionId ?? "");
-    if (!pane) {
-      // nothing to focus without a pane, but the record still knows the rest
+    if (!pane) {                                   // nothing to focus, but the record knows
       found.push(new Instance({pid, summary: title || cmd, path: rec.cwd ?? "",
         state, asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
-        statusSince: since}));
+        name: rec.name ?? "", sock: rec.messagingSocketPath ?? "", statusSince: since}));
       continue;
     }
     const client = clientBySession.get(pane.session_name) ?? {};
@@ -420,12 +353,13 @@ export async function discover() {
       window: pane.window_index,
       paneIndex: pane.pane_index,
       path: pane.pane_current_path,
-      // the transcript is the whole answer once there is a record: it names the session
-      // claude is in *now*, where pane_title still shows the one before a /clear.
-      // pane_title is what is left when there is no record, as with state
+      // the transcript names the session claude is in *now*; pane_title still shows the
+      // one before a /clear, and is only what is left with no record, as with state
       summary: Object.keys(rec).length ? title : summaryOf(pane.pane_title),
       state,                       // "" with no record; the scrape below fills it in
       asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
+      name: rec.name ?? "",
+      sock: rec.messagingSocketPath ?? "",
       statusSince: since,
       lastWrite: state ? 0 : lastWrite(pane.pane_current_path),
       clientTty: client.client_tty ?? "",
@@ -435,18 +369,16 @@ export async function discover() {
     found.push(inst);
     if (!state) scrape.push([inst, pane.pane_id]);
   }
-  // all at once: these are the instances Claude Code wrote no record for, and serially
-  // they were the whole cost of a poll on a box with several of them
+  // all at once: serially, these were the whole cost of a poll on a box with several
   await Promise.all(scrape.map(async ([inst, pane]) =>
     inst.state = paneState(await capture(pane))));
   tagTabs(found);
   return found.sort((a, b) => byCodePoint(a.shortPath, b.shortPath) || a.pid - b.pid);
 }
 
-// Tab suffix for the path, but only where it disambiguates.
-//
-// One kitty window shows one tmux window at a time, so the tab number only matters when a
-// session holds more than one claude. Two in the same window get `:N.M` with the pane.
+// Tab suffix for the path, only where it disambiguates: one kitty window shows one tmux
+// window at a time, so the number matters only when a session holds more than one claude.
+// Two in the same window get `:N.M` with the pane.
 function tagTabs(found) {
   for (const i of found) {
     const peers = found.filter((p) => p.session && p.session === i.session);
@@ -455,461 +387,3 @@ function tagTabs(found) {
     i.tab = sameWindow.length > 1 ? `${i.window}.${i.paneIndex}` : i.window;
   }
 }
-
-// The sort a UI offers, and what "state" means as an order: the ones that want you first,
-// then the ones working, then the empty ones, which are interchangeable.
-const STATE_ORDER = {wait: 0, busy: 1, free: 2};
-export const SORTS = ["state", "path"];
-
-// Subsequence match. Returns {score, idx} or null; lowest score wins.
-//
-// Greedy forward to prove the match exists, then greedy backward from the last hit, which
-// pulls the matched characters as far right as they will go and so collapses "cx" onto the
-// trailing `cx` of ~/prj/ccx instead of taking the c before it. Every character skipped
-// costs 2, or 1 when the match lands on a word start, so a match at the head of a path
-// segment beats one buried mid-word.
-export function fuzzy(needle, hay) {
-  const low = hay.toLowerCase();
-  const idx = [];
-  let at = 0;
-  for (const c of needle) {
-    at = low.indexOf(c, at);
-    if (at < 0) return null;
-    idx.push(at);
-    at += 1;
-  }
-  for (let n = idx.length - 2; n >= 0; n--) {
-    idx[n] = low.lastIndexOf(needle[n], idx[n + 1] - 1);
-  }
-  let score = 0;
-  for (let n = 0; n < idx.length; n++) {
-    const i = idx[n];
-    const gap = n ? i - idx[n - 1] - 1 : i;
-    score += gap * (i === 0 || !/[\p{L}\p{N}]/u.test(hay[i - 1]) ? 1 : 2);
-  }
-  return {score, idx};
-}
-
-// The list in display order, which both UIs want identically.
-//
-// Within a state the one stuck there longest goes on top, so the sessions that want you
-// float up. A filter outranks the sort entirely: you typed those keys to reach one row, so
-// the closest match goes first and enter takes it, with the sort breaking ties.
-export function rank(instances, needle = "", sort = "state") {
-  const cmp = sort === "state"
-    ? (a, b) => STATE_ORDER[a.state] - STATE_ORDER[b.state] || a.since - b.since
-    : (a, b) => byCodePoint(a.shortPath, b.shortPath) || a.pid - b.pid;
-  if (!needle) return [...instances].sort(cmp);
-  const scored = [];
-  for (const i of instances) {
-    const hits = [fuzzy(needle, i.shortPath), fuzzy(needle, i.summary)].filter((h) => h);
-    if (hits.length) scored.push([Math.min(...hits.map((h) => h.score)), i]);
-  }
-  return scored.sort((a, b) => a[0] - b[0] || cmp(a[1], b[1])).map((p) => p[1]);
-}
-
-// ------------------------------------------------------------------ what both UIs paint
-
-// The TUI and the panel have to agree on these or the two tools stop looking like one
-// tool, and there is no drawing layer left to share now that the panel is HTML. gold is
-// the brightest thing on either screen and nothing else is allowed above it by relative
-// luminance, which is what makes a `wait` row findable without reading it: gold .69, the
-// wait summary .68, busy .39, every other summary .23, free and the number and age
-// columns .12. #ffd500 is one shade deeper than xterm 220, the exact color Claude Code
-// paints "⏵⏵ auto mode on" with, and reads as the same yellow.
-export const STATE = {
-  wait: {label: "● wait", color: "#ffd500"},
-  ask: {label: "◆ wait", color: "#ffd500"},
-  busy: {label: "◐ busy", color: "#93aeaa"},
-  free: {label: "◌ free", color: "#626262"},
-};
-
-/* The STATE entry a row draws with.
- *
- * `ask` is a fourth glyph and not a fourth state: it sorts, counts and rings as `wait`,
- * and the record's `waitingFor` is the only thing that picks it. What it separates is the
- * half of `wait` that a list cannot otherwise show, a dialog holding the screen against
- * the turn merely being over, without splitting the one question the list answers, which
- * is whether this one wants you.
- *
- * ◆ U+25C6 is East Asian Ambiguous like ●, ◐ and ◌, so kitty draws it narrow and
- * `◆ wait` is the same 6 cells as `● wait`; a Wide glyph here would push the whole row
- * one cell out.
- */
-export function stateOf(inst) {
-  if (inst.state === "wait" && inst.asking) return STATE.ask;
-  return STATE[inst.state] ?? STATE.free;
-}
-
-// Out of ~/.config/kitty/kitty.conf, so the tools look like the terminal they run in:
-// #ceaadf is color13, #b8a0be is color5.
-//
-// `bar` and `panelBg` are two different surfaces and the one shade between them is not a
-// mistake: the TUI's top bar is Textual's `$panel`, #181020, sitting on a #000 screen,
-// while the systray panel is its own floating near-black #0e0b12 over the desktop. The
-// Textual theme also had #0e0b12 as `surface`, which nothing in the TUI ever drew.
-export const PALETTE = {
-  accent: "#ceaadf", mauve: "#b8a0be", dim: "#626262", text: "#d6d6dc",
-  bg: "#000000", bar: "#181020", panelBg: "#0e0b12", edge: "#35284a", cursor: "#2a1e38",
-  gold: "#ffd500", idle: "#82828a", hint: "#4a4a55", error: "#df6565",
-};
-
-// the digits label the first ten rows, in the order they are drawn
-export const NUMBERS = "1234567890";
-
-// ----------------------------------------------------------------------- the bell
-
-// A UI rings this on StateClock.woke; the library itself never makes a sound.
-//
-// The sound is BOTTLE, at the bottom of this file, so the bell is the same one on both
-// platforms: freedesktop's complete.oga, the old Linux default, ships with a sound theme
-// and not with a base install. Nothing here writes a file. macOS plays the bytes through
-// AVAudioPlayer (see ring()), Linux pipes them to a player's stdin, and each argv ends in
-// how that player spells stdin: `paplay -` opens a file named `-` and fails, so paplay
-// gets nothing. In order of how little they do; ffplay decodes it itself.
-const PLAYERS = MAC ? [] : [
-  ["pw-play", "-"],
-  ["paplay"],
-  ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-"],
-];
-let PLAYER = null;             // resolved on the first ring, then reused
-let BELL = null;               // BOTTLE unpacked, by loadBell()
-let RINGER = null;             // the AVAudioPlayer holding it, on the first ring; macOS only
-let OBJC = null;               // the libobjc handle and its selectors, once loaded
-
-// The player argv, resolved once: the first of PLAYERS that is installed, or [].
-function bellCmd() {
-  if (PLAYER === null) {
-    PLAYER = PLAYERS.find((p) => sh("sh", "-c", `command -v ${p[0]}`).trim()) ?? [];
-  }
-  return PLAYER;
-}
-
-// What will make the sound, for doctor.
-export function ringer() {
-  return MAC ? "AVAudioPlayer" : bellCmd().join(" ") || "(no player)";
-}
-
-// BOTTLE unpacked into the bytes of a WAV file.
-//
-// Async because this is where the Python's lzma went: Deno has no lzma at all, and the
-// only decompressor in the runtime is DecompressionStream, which is a stream. gzip costs
-// 3517 bytes against lzma's 3128, so the source file carries 520 more characters of
-// base64 and nothing else changes. Being async is why it is called once at startup
-// instead of lazily on the first ring: play() is called from a poll that cannot await.
-export async function loadBell() {
-  if (BELL) return;
-  const packed = Uint8Array.from(atob(BOTTLE.replace(/\s/g, "")), (c) => c.charCodeAt(0));
-  const plain = new Uint8Array(await new Response(
-    new Blob([packed]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
-  // second differences: cumulative sum twice gets the samples back. A 185Hz tone barely
-  // moves between samples, which is what makes them small numbers that repeat and takes
-  // 17640 bytes of PCM to 3128
-  const deltas = new Int16Array(plain.buffer, plain.byteOffset, plain.length / 2);
-  const pcm = new Int16Array(deltas.length);
-  let run = 0, value = 0;
-  for (let n = 0; n < deltas.length; n++) {
-    run += deltas[n];
-    value += run;
-    pcm[n] = value;
-  }
-  BELL = wav(pcm);
-}
-
-// The 44 bytes of RIFF header in front of the samples. The Python got this from `wave`.
-function wav(pcm) {
-  const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-  const out = new Uint8Array(44 + bytes.length);
-  const v = new DataView(out.buffer);
-  out.set(BYTES.encode("RIFF"), 0);
-  v.setUint32(4, 36 + bytes.length, true);
-  out.set(BYTES.encode("WAVEfmt "), 8);
-  v.setUint32(16, 16, true);            // fmt chunk size
-  v.setUint16(20, 1, true);             // PCM
-  v.setUint16(22, 1, true);             // mono
-  v.setUint32(24, RATE, true);
-  v.setUint32(28, RATE * 2, true);      // byte rate
-  v.setUint16(32, 2, true);             // block align
-  v.setUint16(34, 16, true);            // bits
-  out.set(BYTES.encode("data"), 36);
-  v.setUint32(40, bytes.length, true);
-  out.set(bytes, 44);
-  return out;
-}
-
-export function soundBytes() {
-  return BELL ?? new Uint8Array(0);
-}
-
-const cstr = (s) => BYTES.encode(`${s}\0`);
-
-// Play wav through AVAudioPlayer, which takes bytes and wants no file: no macOS player
-// reads stdin. THE STOP IS NOT OPTIONAL. Once the sound has run out, play on its own
-// returns YES and does nothing. objc_msgSend needs one alias per signature.
-function ring(sound) {
-  if (!OBJC) {
-    const lib = Deno.dlopen("/usr/lib/libobjc.A.dylib", {
-      objc_getClass: {parameters: ["buffer"], result: "pointer"},
-      sel_registerName: {parameters: ["buffer"], result: "pointer"},
-      msg: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "pointer"},
-      msgBool: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "bool"},
-      msgBytes: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "buffer", "usize"], result: "pointer"},
-      msgTwo: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "pointer", "pointer"], result: "pointer"},
-      msgDouble: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "f64"], result: "void"},
-    });
-    Deno.dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", {});
-    OBJC = lib.symbols;
-  }
-  const s = OBJC;
-  const cls = (n) => s.objc_getClass(cstr(n));
-  const sel = (n) => s.sel_registerName(cstr(n));
-  if (!RINGER) {
-    const data = s.msgBytes(s.msg(cls("NSData"), sel("alloc")),
-      sel("initWithBytes:length:"), sound, BigInt(sound.length));
-    RINGER = s.msgTwo(s.msg(cls("AVAudioPlayer"), sel("alloc")),
-      sel("initWithData:error:"), data, null);
-    if (!RINGER) return;
-    s.msgBool(RINGER, sel("prepareToPlay"));
-  }
-  s.msgBool(RINGER, sel("stop"));
-  s.msgDouble(RINGER, sel("setCurrentTime:"), 0);
-  s.msgBool(RINGER, sel("play"));
-}
-
-// Ring the bell and return immediately. A no-op until loadBell() has run.
-//
-// The WAV is 17684 bytes, under the 64KB a pipe holds, so the write cannot block on a
-// player that is slow to start. On Linux the player runs for the length of the sound while
-// the poll comes round every 1.5s, so it is never waited on; Deno reaps the child itself
-// once its status is taken, which is what the .status.catch() is for and what the Python
-// needed an explicit poll() sweep to do. No player installed is no sound.
-export function play() {
-  if (!BELL) return;
-  if (MAC) {
-    try {
-      ring(BELL);
-    } catch {
-      // no audio device, or a runtime that moved: silence beats a traceback on the TUI
-    }
-    return;
-  }
-  const cmd = bellCmd();
-  if (!cmd.length) return;
-  try {
-    const child = new Deno.Command(cmd[0], {args: cmd.slice(1), stdin: "piped",
-      stdout: "null", stderr: "null"}).spawn();
-    const w = child.stdin.getWriter();
-    w.write(BELL).then(() => w.close()).catch(() => {});
-    child.status.catch(() => {});
-  } catch {
-    // nothing to play it with
-  }
-}
-
-// ------------------------------------------------------------------------ the jump
-
-// `kitten @` writes a bare `ESC P @kitty-cmd {...} ESC \` to the tty. tmux forwards only
-// `ESC P tmux; ... ESC \`, so the bare form is swallowed and the command never reaches
-// kitty (silently, with --no-response). So build the sequence here and wrap it.
-const KITTY_RC_VERSION = [0, 26, 0];
-
-// Send one kitty remote-control command. With a `tty` the bare sequence goes straight
-// there, which is the only path that works with no controlling terminal of our own.
-// Without one it falls back to /dev/tty, wrapped for tmux, which swallows a bare DCS.
-export function sendKitty(command, payload, tty = null) {
-  const msg = {cmd: command, version: KITTY_RC_VERSION, no_response: true, payload};
-  const wid = Deno.env.get("KITTY_WINDOW_ID");
-  if (wid) msg.kitty_window_id = Number(wid);
-  let seq = `\x1bP@kitty-cmd${JSON.stringify(msg)}\x1b\\`;
-  if (!tty && Deno.env.get("TMUX")) {
-    seq = `\x1bPtmux;${seq.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`;
-  }
-  const target = tty ?? "/dev/tty";
-  try {
-    // create/truncate because that is what the Python's open(target, "w") did; on a tty,
-    // which is what every real target is, both flags are no-ops
-    const f = Deno.openSync(target, {write: true, create: true, truncate: true});
-    try {
-      f.writeSync(BYTES.encode(seq));
-    } finally {
-      f.close();
-    }
-    return true;
-  } catch (e) {
-    console.error(`cannot write to ${target}: ${e.message}`);
-    return false;
-  }
-}
-
-// The niri window id for a process, or null. niri is the compositor on the Linux box.
-//
-// A kitty process there owns exactly one OS window, so its pid identifies the window;
-// `single_instance` or `kitty @ launch --type=os-window` would break that and this would
-// raise whichever of them niri lists first. Nothing else on Wayland can do better without
-// kitty telling us which of its windows is where, which it cannot.
-async function niriWindow(pid) {
-  try {
-    for (const w of JSON.parse(await sh("niri", "msg", "--json", "windows") || "[]")) {
-      if (String(w.pid) === String(pid)) return w.id;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-// Bring the terminal's own window to the front. The per-platform half of the jump: on
-// Wayland an app cannot raise itself without a recent interaction, so the compositor
-// has to be asked by its own window id.
-async function raiseWindow(inst) {
-  if (MAC) {
-    await sh("open", "-a", "kitty");
-    return;
-  }
-  if (!inst.kittyProc) return;
-  const wid = await niriWindow(inst.kittyProc);
-  if (wid !== null) await sh("niri", "msg", "action", "focus-window", "--id", String(wid));
-}
-
-// What raiseWindow() would do with this instance, for `ccx doctor` to print.
-export async function raiseTarget(inst) {
-  if (MAC) return "open -a kitty";
-  if (!inst.kittyProc) return "(no kitty ancestor)";
-  const wid = await niriWindow(inst.kittyProc);
-  return wid !== null ? `niri ${wid}` : `(kitty ${inst.kittyProc} not in niri)`;
-}
-
-// Focus the instance. Returns an error message, or null when it worked.
-export async function jump(inst) {
-  if (!inst.pane) return `pid ${inst.pid} is not inside tmux; nothing to focus`;
-  // one tmux call: the three commands must land in this order, and `;` is how tmux is
-  // told that without paying for three processes
-  const client = inst.clientTty
-    ? ["switch-client", "-c", inst.clientTty, "-t", inst.session, ";"]
-    : Deno.env.get("TMUX") ? ["switch-client", "-t", inst.session, ";"] : [];
-  await sh("tmux", ...client,
-    "select-window", "-t", `${inst.session}:${inst.window}`, ";",
-    "select-pane", "-t", inst.pane);
-  if (inst.match) {
-    // the client's own tty, so this works with no controlling terminal of our own
-    sendKitty("focus-window", {match: inst.match}, inst.clientTty || null);
-  }
-  await raiseWindow(inst);
-  return null;
-}
-
-// Quitting the TUI skips the normal unwind, so anything that has to run before the process
-// dies registers itself here.
-export const ON_EXIT = [];
-
-// Name our own tmux window for as long as the app runs. Returns the restore.
-//
-// tmux's automatic-rename uses the pane's foreground command, which is how the tab read
-// `uv` under the Python's shebang and reads `deno` under this one. `allow-rename` is off
-// by default, so the ESC k escape is ignored and only `rename-window` works; it also turns
-// automatic-rename off for the window, hence the restore.
-export function tmuxWindowName(name) {
-  const pane = Deno.env.get("TMUX_PANE");
-  if (!pane) return () => {};
-  // shSync throughout, not sh: the restore below runs from ON_EXIT, which quit() calls
-  // immediately before Deno.exit, and Deno.exit does not wait for a promise
-  const was = shSync("tmux", "display-message", "-p", "-t", pane,
-    "#{automatic-rename}\t#{window_name}").trim();
-  shSync("tmux", "rename-window", "-t", pane, name);
-
-  const restore = () => {
-    const [auto, before] = [was.slice(0, was.indexOf("\t")), was.slice(was.indexOf("\t") + 1)];
-    if (auto === "1" || !before) {
-      shSync("tmux", "set-window-option", "-t", pane, "automatic-rename", "on");
-    } else {
-      shSync("tmux", "rename-window", "-t", pane, before);
-    }
-  };
-  ON_EXIT.push(restore);
-  return () => {
-    ON_EXIT.splice(ON_EXIT.indexOf(restore), 1);
-    restore();
-  };
-}
-
-// Name our own kitty window for as long as the app runs. Target the client's kitty
-// ancestor, never KITTY_WINDOW_ID: inside a pane that is inherited from the environment
-// the tmux SERVER started in and can name a window that closed long ago.
-export async function kittyWindowTitle(name) {
-  let target = {};
-  if (Deno.env.get("TMUX")) {
-    const pid = (await sh("tmux", "display-message", "-p", "#{client_pid}")).trim();
-    if (!pid) return () => {};        // no client attached, so no window to name
-    target = {match: `pid:${kittyOwner(Number(pid), await processes())[0]}`};
-  }
-  sendKitty("set-window-title", {...target, title: name});
-
-  const restore = () => sendKitty("set-window-title", target);  // no title: kitty's default
-  ON_EXIT.push(restore);
-  return () => {
-    ON_EXIT.splice(ON_EXIT.indexOf(restore), 1);
-    restore();
-  };
-}
-
-// ------------------------------------------------------------------ the bell, inlined
-
-// macOS's /System/Library/Sounds/Bottle.aiff, cut to fit in a source file. To redo it:
-//
-//     afconvert -f WAVE -d LEI16@22050 -c 2 Bottle.aiff b.wav    # a real resampler
-//     x = (left + right) / 2, cut to 0.40s, 40ms fade, round(x / 16) * 16
-//     base64(gzip(second differences of x, as little-endian int16))
-const RATE = 22050;
-const BOTTLE = `
-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
-lPRbvnZwm5P7+nF13kNOrQpMjGcf2WLyOUdVtFTiHBS3eRSxis9AaleeSkCRvaoiSnLbbGG5Mspmzaq0OkMjztf4ukSepO9h
-ypay1moUkOcjWCFSJVIFcI4F5tVBWjae4FVlNFfVGQyJxp6hb9IG8BTF5zrjWi4xR9mn3AduIa7lXlg9Q8m7nE19BgNFLtHS
-Qet8R/s3z49KybRRR6jyKXiDR3JktHUWKEaXWo85B5XRUhdI6lmOVef87TM05dqGjR2flmeVls5X5XPd17R1qM441+Wvlj5b
-59hK78STkzitk0Bce8gyd8UiZl29yByf10NcQmcy/PzkUPb90hbhZF7tM1e159T8tTktY02WRivWtiijiPVl7/OTZNk/9ypb
-KFeZ0o7fnfzn6yBWOxh4smcrq+XSVmvraa8DrSgt97ta861niyd+WUugvN8+K9c64dbWa7mrWleY2JBlO47ip/+h0bb7ch+2
-tYuKUOd62Izd70/1tWNEK460ziuW3n1u+VKadfSDt9+ldba8URc+qE2549rKm84jJZ6eGPncB1unFrCxV13v1UHTZlFE6a96
-ADTP6WLD18+trmU/73dC2/Jsxdr6JPpZXDnj7ytza6+tn+vxM722vLglhXPPPD+HAnB+puazVbaO5/gl/bY1cDaDVmzF31gz
-2rb8WfT/XBbf0/O7WZ3N5f3cWmujbmQL39fse11+Jfs4O5l9loN81vJsjPf2/HkW/rV1/6t++9UZfyWz+errTNPw5pQKfGOW
-EbuBb2q7fvpTM34vgXfy+D3qiiEq+Jbnz2d8PuczPv+M/9/pXc9CF/9t8ftj1MjVn9H8GQv6Lp3ve9E/NYvf7fmnXvE3XjwX
-RbZj/d4av2Z/Pxtz/o6M3+v6q0/fcfU+J//p1xnHP+XT3+X+J+b4tzz5/8F//339+/ra6782DRAM6EQAAA==`;

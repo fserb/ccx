@@ -1,18 +1,29 @@
-#!/usr/bin/env -S deno run -A
+#!/bin/sh
+':' //; exec deno run -A --ext js "$(readlink -f "$0")" "$@"
+// Two lines, two languages. sh runs line 2 and never reaches line 3; deno strips the
+// hashbang and reads line 2 as a string then a comment. The re-exec is what makes a symlink
+// on PATH work: deno resolves a relative import against the path it was handed, so
+// ~/bin/ccx -> here looks for claudes.js in ~/bin and dies. Passing the realpath also gets
+// `import.meta.dirname` right, which is where BUNDLE looks for ccx.app.
 
-import {
-  discover, fuzzy, jump, kittyWindowTitle, loadBell, NUMBERS, ON_EXIT, PALETTE, play,
-  raiseTarget, rank, ringer, sessionRecords, sh, soundBytes, SORTS, stateOf, StateClock,
-  tmuxWindowName,
-} from "./claudes.js";
+import {discover, fmtAge, sessionRecords, StateClock} from "./claudes.js";
+import {HOME, ON_EXIT, sh} from "./sh.js";
+import {fuzzy, NUMBERS, PALETTE, rank, SORTS, stateOf} from "./view.js";
+import {jump, kittyWindowTitle, raiseTarget, tmuxWindowName} from "./jump.js";
+import {loadBell, play, ringer, soundBytes} from "./bell.js";
 
-// --------------------------------------------------------------------------- render
+// `peer.js` and `chat.js` load on use, not at startup: a missing one must cost `ccx send`
+// its error line and nothing else. A static import would take `list`, `doctor` and the TUI
+// down with it, which is the same reason `systray.js` is reached this way.
+const peerModule = () => import("./peer.js");
+const chatModule = () => import("./chat.js");
+
+// render
 
 const ESC = "\x1b";
 const RESET = `${ESC}[0m`;
 const BOLD = `${ESC}[1m`;
-// built, not written as a literal: the ESC byte inside a regex literal is what `deno lint`'s
-// no-control-regex is about, and the byte is the point here
+// built, not a literal: an ESC byte inside a regex literal trips deno lint's no-control-regex
 const SGR = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
 
 function sgr(hex, layer) {
@@ -20,8 +31,7 @@ function sgr(hex, layer) {
   return `${ESC}[${layer};2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`;
 }
 
-// A run is {t: text, c: hex fg, b: bold}. Every run starts with a reset, so a run only
-// ever says what it wants and nothing leaks out of the run before it.
+// every run opens with a reset, so nothing leaks out of the run before it
 function paint(runs, back, bold = false) {
   let out = "";
   for (const r of runs) {
@@ -32,18 +42,15 @@ function paint(runs, back, bold = false) {
   return out + RESET;
 }
 
-// Display width in cells, which String.length is not: a CJK character is one UTF-16
-// unit and two cells, a combining mark is one and none, so widths walk grapheme
-// clusters. The three state glyphs (● ◐ ◌) are East Asian *Ambiguous* and kitty
-// draws ambiguous narrow, so counting them wide pushes the state column one cell out.
+// display cells, which String.length is not, so widths walk grapheme clusters. The state
+// glyphs (● ◐ ◌ ◆) are East Asian *Ambiguous* and kitty draws ambiguous narrow.
 const GRAPHEMES = new Intl.Segmenter(undefined, {granularity: "grapheme"});
 const ZERO = /^[\p{Mn}\p{Me}\p{Cf}]/u;
 const WIDE = /^[\u1100-\u115f\u2329\u232a\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u;
 
 function cell(grapheme) {
   if (ZERO.test(grapheme)) return 0;
-  // emoji presentation is two cells: U+FE0F asks for it, U+1F300 and up already have it;
-  // below that, © and ™ are pictographic and still drawn narrow
+  // emoji presentation is two cells: U+FE0F asks for it, U+1F300 and up already have it
   if (grapheme.includes("\ufe0f") || grapheme.codePointAt(0) >= 0x1f300) return 2;
   return WIDE.test(grapheme) ? 2 : 1;
 }
@@ -51,8 +58,7 @@ function cell(grapheme) {
 const cells = (s) => [...GRAPHEMES.segment(s)].reduce((n, g) => n + cell(g.segment), 0);
 const span = (runs) => runs.reduce((n, r) => n + cells(r.t), 0);
 
-// Crop to `width` cells and pad out to it. Cropping walks clusters and stops on the
-// budget, so a two-cell character that does not fit leaves a space, not half of itself.
+// stops on the cell budget, so a two-cell character that does not fit leaves a space
 function fit(runs, width) {
   const out = [];
   let n = 0;
@@ -71,6 +77,42 @@ function fit(runs, width) {
     if (t) out.push({...r, t});
   }
   if (n < width) out.push({t: " ".repeat(width - n)});
+  return out;
+}
+
+// the head of `text` that fits in `width` cells, and the rest. fit() pads and takes runs;
+// this one is for wrapping a body, where the tail is the next line rather than dropped
+function cut(text, width) {
+  let head = "", n = 0;
+  for (const g of GRAPHEMES.segment(text)) {
+    const w = cell(g.segment);
+    if (n + w > width) break;
+    head += g.segment;
+    n += w;
+  }
+  return [head, text.slice(head.length)];
+}
+
+// Greedy word wrap on display cells. A word longer than the line is cut rather than left to
+// run past the edge: a path or a URL has no space in it to break on.
+function wrap(text, width) {
+  if (width < 2) return [text];
+  const out = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    if (!line) line = word;
+    else if (cells(line) + 1 + cells(word) <= width) line += ` ${word}`;
+    else {
+      out.push(line);
+      line = word;
+    }
+    while (cells(line) > width) {
+      const [head, rest] = cut(line, width);
+      out.push(head);
+      line = rest;
+    }
+  }
+  out.push(line);
   return out;
 }
 
@@ -96,8 +138,7 @@ function tableLine(fields, lay, cols, back, bold = false) {
   return margins(fit(runs, tableWidth(lay, cols)), cols, back, bold);
 }
 
-// As wide as its columns or as the screen, whichever is less: anything narrower crops
-// rather than running the line past the right edge and scrolling the frame.
+// narrower than its columns crops, or the line runs past the edge and scrolls the frame
 const tableWidth = (lay, cols) => Math.max(0, Math.min(lay.inner, cols - 1));
 
 function margins(body, cols, back, bold = false) {
@@ -109,8 +150,8 @@ function marks(text, color, needle) {
   if (!needle) return [{t: text, c: color}];
   const hit = fuzzy(needle, text);
   if (!hit) return [{t: text, c: color}];
-  // fuzzy() returns UTF-16 indices, so walk code points and carry the offset: splitting a
-  // surrogate pair into two runs would put an SGR sequence through the middle of it
+  // fuzzy()'s indices are UTF-16, so walk code points and carry the offset, or a surrogate
+  // pair splits across two runs with an SGR sequence through the middle
   const on = new Set(hit.idx);
   const runs = [];
   let i = 0;
@@ -127,7 +168,7 @@ function marks(text, color, needle) {
 const KEY = (t) => ({t, c: PALETTE.accent, b: true});
 const KEYS = [KEY("1-0"), {t: "/", c: PALETTE.text}, KEY("enter"),
   {t: " jump   ", c: PALETTE.text}, KEY("esc"), {t: " quit   ", c: PALETTE.text},
-  KEY("^s"), {t: " sort", c: PALETTE.text}];
+  KEY("^s"), {t: " sort   ", c: PALETTE.text}, KEY("^t"), {t: " chat", c: PALETTE.text}];
 
 function barLine(view, cols) {
   const search = view.filter
@@ -139,8 +180,7 @@ function barLine(view, cols) {
   const loud = view.waiting > 0 && !view.filter;
   const status = [{t: count, c: loud ? PALETTE.gold : PALETTE.mauve, b: loud},
     {t: `  ·  by ${view.sort}`, c: PALETTE.mauve}];
-  // the hints go first on a narrow screen: the counts are the only place the number of
-  // waiting sessions is written
+  // hints go first on a narrow screen: the counts are the only place waiting is written
   const room = cols - span(status) - 4;
   const keys = room - span(KEYS) - 2 >= 16 ? [{t: " "}, ...KEYS, {t: " "}] : [];
   const left = Math.max(0, room - span(keys) - 1);
@@ -168,7 +208,6 @@ function rowLine(inst, n, cursor, lay, cols, needle) {
   ], lay, cols, cursor ? PALETTE.cursor : PALETTE.bg, cursor);
 }
 
-// One line across the table, indented to where the state column starts.
 function noteLine(text, lay, cols) {
   return margins(fit([{t: " ".repeat(lay.xs[1])}, {t: text, c: PALETTE.hint}],
     tableWidth(lay, cols)), cols, PALETTE.bg);
@@ -208,7 +247,95 @@ function render(view) {
   return lines;
 }
 
-// ------------------------------------------------------------------------------ the tui
+// the chat view
+
+// What the agents in this directory said to each other. `chat.js` reads it, this draws it.
+
+const CHAT_INDENT = 6;          // past the age column, so a body lines up under itself
+
+/* One message as painted lines: a header of age, sender and recipient, then the body
+ * wrapped under it.
+ *
+ * The body WRAPS rather than truncating. A message here runs to 2KB, and one cut to a
+ * single line is a notification, while `chat` exists to read what was said; `ccx list` is
+ * already the one-line view. The age is relative and not a clock time, since the question a
+ * log answers is how long ago, and a clock time leaves the reader doing the arithmetic. The
+ * cost is that a printed line keeps the age it had when it was printed, which is what
+ * scrollback is anyway.
+ */
+function chatLines(msg, width, now) {
+  const head = [
+    {t: fmtAge(now - msg.at).padStart(4), c: PALETTE.dim},
+    {t: "  "},
+    {t: msg.from, c: PALETTE.accent, b: true},
+  ];
+  // → is East Asian Ambiguous, so kitty draws it in one cell, like the state glyphs
+  if (msg.to) head.push({t: " → ", c: PALETTE.dim}, {t: msg.to, c: PALETTE.mauve});
+  const out = [head];
+  for (const para of msg.body.split("\n")) {
+    for (const text of wrap(para, Math.max(8, width - CHAT_INDENT))) {
+      out.push([{t: " ".repeat(CHAT_INDENT)}, {t: text, c: PALETTE.text}]);
+    }
+  }
+  return out;
+}
+
+function chatRows(msgs, cols, now) {
+  const out = [];
+  msgs.forEach((m, n) => {
+    if (n) out.push([]);                       // one blank line between messages
+    out.push(...chatLines(m, Math.max(20, cols - 2), now));
+  });
+  return out;
+}
+
+const CHAT_WRAP = {msgs: null, cols: 0, count: -1, tick: 0, rows: []};
+
+// The wrapped conversation, rebuilt when the width, the count or the second moves. A held
+// arrow delivers eight scrolls in one read and each one needs the line count to clamp
+// against; the second is in the key because the ages are drawn into the rows.
+function chatBody(msgs, cols, now) {
+  const tick = Math.floor(now);
+  const w = CHAT_WRAP;
+  if (w.msgs !== msgs || w.cols !== cols || w.count !== msgs.length || w.tick !== tick) {
+    Object.assign(w, {msgs, cols, count: msgs.length, tick, rows: chatRows(msgs, cols, now)});
+  }
+  return w.rows;
+}
+
+function chatBar(cwd, count, cols) {
+  const keys = [KEY("^t"), {t: " list   ", c: PALETTE.text}, KEY("esc"),
+    {t: " quit", c: PALETTE.text}];
+  const left = [{t: "chat  ", c: PALETTE.mauve, b: true}, {t: cwd, c: PALETTE.accent}];
+  const status = [{t: `${count} msg`, c: PALETTE.mauve}];
+  const room = cols - span(status) - 4;
+  const shown = room - span(keys) - 2 >= 12 ? [{t: " "}, ...keys, {t: " "}] : [];
+  const gap = Math.max(0, room - span(shown) - 1);
+  return paint(fit([{t: " "}, ...fit(left, gap), {t: "  "}, ...status, {t: "  "}, ...shown],
+    cols), PALETTE.bar);
+}
+
+function chatRender(view) {
+  const {cols, height, msgs, now} = view;
+  const rows = chatBody(msgs, cols, now);
+  const room = Math.max(1, height - 2);
+  const start = Math.max(0, Math.min(view.offset, rows.length - room));
+  const lines = [chatBar(view.cwd, msgs.length, cols), ruleLine(cols)];
+  if (!rows.length) lines.push(noteLine("nothing has been said in here yet", layout(cols), cols));
+  for (const runs of rows.slice(start, start + room)) {
+    lines.push(margins(fit(runs, Math.max(0, cols - 1)), cols, PALETTE.bg));
+  }
+  const blank = paint([{t: " ".repeat(cols)}], PALETTE.bg);
+  while (lines.length < height) lines.push(blank);
+  lines.length = height;
+  if (view.toast) lines[height - 1] = toastLine(view.toast, cols);
+  return lines;
+}
+
+// the tui
+
+const CWD = Deno.cwd();
+const SHORT_CWD = CWD.replace(HOME, "~");
 
 const app = {
   clock: new StateClock(),
@@ -221,6 +348,7 @@ const app = {
   offset: 0,
   toast: null,
   fade: 0,
+  chat: {on: false, msgs: [], offset: 0, pinned: true, stop: null},
 };
 
 const OUT = new TextEncoder();
@@ -236,8 +364,7 @@ function size() {
   }
 }
 
-// The filter with its ends trimmed. A leading space is how to search for something
-// starting with a digit, since a digit in an *empty* filter picks a row instead.
+// trimmed: a leading space is how to search for a digit, which in an empty filter picks a row
 const needle = () => app.filter.trim().toLowerCase();
 
 function view() {
@@ -257,13 +384,8 @@ function view() {
   };
 }
 
-/* One poll. Async now, so the input loop is not held for the ~59ms discover() costs.
- *
- * The guard is what async buys and also what it costs: the 1.5s interval no longer waits
- * for the poll it started, so a discover that outran its interval would stack up until one
- * of them won the race and put a stale listing on the screen. Skipping instead means a slow
- * poll drops the next tick rather than queueing it.
- */
+// the 1.5s interval no longer waits for the poll it started, so without the guard a slow
+// discover would stack up and race a stale listing onto the screen; skipping drops the tick
 let polling = false;
 async function reload() {
   if (polling) return;
@@ -287,23 +409,77 @@ function refresh() {
   app.offset = Math.max(app.offset, app.cursor - room + 1);
 }
 
-function draw() {
-  write(`${ESC}[H${render(view()).join("\r\n")}`);
+function chatView() {
+  const {cols, height} = size();
+  return {cwd: SHORT_CWD, msgs: app.chat.msgs, offset: app.chat.offset, toast: app.toast,
+    cols, height, now: Date.now() / 1000};
 }
 
-// Both, not just the pid: one read can carry eight arrow keys and refresh() runs once at
-// the end of it, so a stale app.cursor would compute all eight from the same row.
+function draw() {
+  const frame = app.chat.on ? chatRender(chatView()) : render(view());
+  write(`${ESC}[H${frame.join("\r\n")}`);
+}
+
+const chatRoom = () => Math.max(1, size().height - 2);
+
+// the offset is a line and not a message: a 2KB body is taller than the screen, so a
+// message is not a unit anything can page by
+function scrollChat(delta) {
+  const c = app.chat;
+  const rows = chatBody(c.msgs, size().cols, Date.now() / 1000);
+  const last = Math.max(0, rows.length - chatRoom());
+  c.offset = Math.max(0, Math.min(last, c.offset + delta));
+  c.pinned = c.offset >= last;
+}
+
+/* ctrl+t opens and closes the chat. tmux's prefix here is ctrl+b and ctrl+s is the sort, so
+ * 0x14 is free; no modifier survives on a printable key, since tmux runs `extended-keys
+ * off`, which is what rules out every plain letter.
+ *
+ * escape, ctrl+c and ctrl+q still leave the app from in here rather than backing out to the
+ * list: they are the way out of ccx, and a key that means quit in one view and back in
+ * another is worse than the one keystroke it saves.
+ */
+async function toggleChat() {
+  if (app.chat.on) return closeChat();
+  const c = app.chat;
+  try {
+    const mod = await chatModule();
+    c.msgs = mod.chatLog(CWD);
+    c.stop = mod.watchChat(CWD, (m) => {
+      c.msgs.push(m);
+      if (c.pinned) c.offset = Number.MAX_SAFE_INTEGER;
+      scrollChat(0);
+      draw();
+    });
+  } catch (e) {
+    toast(`no chat here: ${e.message ?? e}`);
+    return draw();
+  }
+  c.on = true;
+  c.offset = Number.MAX_SAFE_INTEGER;          // newest first sight, which scrollChat clamps
+  scrollChat(0);
+  draw();
+}
+
+function closeChat() {
+  app.chat.stop?.();
+  app.chat.stop = null;
+  app.chat.on = false;
+  draw();
+}
+
+// index as well as pid: one read carries eight arrows, refresh() reseats once at the end
 function move(delta) {
   if (!app.ranked.length) return;
   app.cursor = Math.max(0, Math.min(app.ranked.length - 1, app.cursor + delta));
   app.cursorPid = app.ranked[app.cursor].pid;
 }
 
-// Not awaited by its caller: enter does not close the app, so the jump happens while the
-// TUI keeps drawing, and a toast is how a failure gets back to the screen either way.
+// not awaited: enter keeps the app up, so the jump runs while the TUI draws and toasts
 async function jumpRow(n) {
   if (n < 0 || n >= app.ranked.length) return;
-  app.cursor = n;                              // so the cursor shows what was taken
+  app.cursor = n;
   app.cursorPid = app.ranked[n].pid;
   const err = await jump(app.ranked[n]);
   if (err) {
@@ -326,8 +502,7 @@ function sortAt(col, lay) {
   if (SORTS.includes(HEADS[n])) app.sort = HEADS[n];
 }
 
-// The check reads the raw filter and not the needle, or a lone space would strip back to
-// empty and the escape hatch would pick a row instead of filtering.
+// reads the raw filter, not the needle, or a lone space strips to empty and picks a row
 function typed(ch) {
   if (!app.filter && NUMBERS.includes(ch)) {
     jumpRow(NUMBERS.indexOf(ch));
@@ -339,7 +514,8 @@ function typed(ch) {
 function mouse(body, final) {
   if (final !== "M") return;                   // a release; the press already acted
   const [b, x, y] = body.slice(1).split(";").map(Number);
-  if (b & 64) return move(b & 1 ? 1 : -1);     // the wheel moves the cursor
+  if (b & 64) return app.chat.on ? scrollChat(b & 1 ? 3 : -3) : move(b & 1 ? 1 : -1);
+  if (app.chat.on) return;                     // no rows to click on
   if ((b & 3) !== 0) return;                   // not the left button
   const lay = layout(size().cols);
   if (y - 1 === 2) return sortAt(x - 1, lay);  // the header row
@@ -349,6 +525,15 @@ function mouse(body, final) {
 function csi(body, final) {
   if (body.startsWith("<")) return mouse(body, final);
   const key = body + final;
+  if (app.chat.on) {
+    if (key === "A") return scrollChat(-1);
+    if (key === "B") return scrollChat(1);
+    if (key === "5~") return scrollChat(-chatRoom());
+    if (key === "6~") return scrollChat(chatRoom());
+    if (key === "H" || key === "1~") return scrollChat(-Number.MAX_SAFE_INTEGER);
+    if (key === "F" || key === "4~") return scrollChat(Number.MAX_SAFE_INTEGER);
+    return;
+  }
   if (key === "A") return move(-1);
   if (key === "B") return move(1);
   if (key === "5~") return move(-capacity(size().height, app.ranked.length));
@@ -357,8 +542,7 @@ function csi(body, final) {
   if (key === "F" || key === "4~") return move(app.ranked.length);
 }
 
-// A read that is exactly the single byte 0x1b is the escape key, with no timer behind it:
-// a real sequence always arrives in the same read as its ESC.
+// a read of exactly one 0x1b is escape, no timer: a real sequence arrives in the same read
 function handle(chunk) {
   if (chunk.length === 1 && chunk[0] === 0x1b) return quit();
   let i = 0;
@@ -373,6 +557,17 @@ function handle(chunk) {
       continue;
     }
     if (b === 0x1b || b === 0x03 || b === 0x11) return quit();     // esc, ctrl+c, ctrl+q
+    if (b === 0x14) {                                              // ctrl+t
+      toggleChat();
+      i++;
+      continue;
+    }
+    // the chat view has no filter and no row under a cursor, so enter, backspace and every
+    // printable key do nothing at all rather than act on a list that is not on the screen
+    if (app.chat.on) {
+      i++;
+      continue;
+    }
     if (b === 0x13) {                                              // ctrl+s
       app.sort = SORTS[(SORTS.indexOf(app.sort) + 1) % SORTS.length];
       i++;
@@ -400,8 +595,8 @@ function handle(chunk) {
   }
 }
 
-// The alternate screen also hides the two runtime lines the compiled bundle prints at
-// startup. Line wrap off (?7l), or writing the last cell of the last row scrolls the frame.
+// the alternate screen also hides the two lines the bundle prints at startup; wrap off
+// (?7l), or writing the last cell of the last row scrolls the frame
 function enter() {
   Deno.stdin.setRaw(true);
   write(`${ESC}[?1049h${ESC}[?25l${ESC}[?7l${ESC}[?1000h${ESC}[?1006h${ESC}[2J`);
@@ -416,16 +611,17 @@ function leave() {
 
 let restores = [];
 
-// escape to gone in 2ms, and 10ms for ctrl+c or ctrl+q, measured in a pty.
+// escape to gone in 2ms, 10ms for ctrl+c or ctrl+q, measured in a pty
 function quit() {
+  app.chat.stop?.();
   leave();
-  for (const f of restores) f();     // the tmux tab name and the kitty window title
-  for (const f of ON_EXIT) f();      // whatever the library still has registered
+  for (const f of restores) f();
+  for (const f of ON_EXIT) f();
   Deno.exit(0);
 }
 
 async function cmdUi() {
-  // no tty means nothing to put in raw mode, and setRaw would throw instead
+  // no tty: setRaw would throw
   if (!Deno.stdin.isTerminal()) {
     console.error("ccx is a terminal app: try `ccx list` or `ccx --snapshot`");
     Deno.exit(2);
@@ -462,50 +658,68 @@ async function cmdUi() {
   quit();
 }
 
-// ---------------------------------------------------------------------------- snapshot
+// snapshot
 
-// Fixed rows, so the frame is the same every time: a snapshot with a live discover() in
-// it is not reproducible.
+// fixed rows: a snapshot with a live discover() in it is not reproducible
 const NOW = 1_700_000_000;
+// the names are the record's own, which is what `ccx send` resolves a target against; two
+// start with `ccx` on purpose, so a fuzzy target has something to be ambiguous about
 const SAMPLE = [
-  ["wait", 42, "~/prj/ccx", "port ccx from python to deno"],
-  ["busy", 197, "~/prj/wrangler", "wrangler config for the edge worker"],
-  ["free", 8100, "~/web/blob2", ""],
-  // a dialog is up, so this one draws the ◆ rather than the ●; same state, same sort
-  ["wait", 7, "~/blah", "reorganize the skills tree", "edit ~/blah/skills/SKILLS.md"],
-  ["busy", 1500, "~/prj/ccx:2", "inline the bell and play it from memory"],
-  // two-cell characters, so a width that counted code units shows up here as a summary
-  // column one row out of line with the others
-  ["wait", 320, "~/prj/kanji", "日本語のタイトル in a session title"],
-  // over both crops, so the hard cut at 26 and 50 is visible in a frame instead of implied
+  ["wait", 42, "~/prj/ccx", "port ccx from python to deno", "ccx-e8"],
+  ["busy", 197, "~/prj/wrangler", "wrangler config for the edge worker", "wrangler-3a"],
+  ["free", 8100, "~/web/blob2", "", "blob2-7c"],
+  // a dialog is up, so this one draws ◆ rather than ●: same state, same sort
+  ["wait", 7, "~/blah", "reorganize the skills tree", "blah-11",
+    "edit ~/blah/skills/SKILLS.md"],
+  ["busy", 1500, "~/prj/ccx:2", "inline the bell and play it from memory", "ccx-2f"],
+  // two-cell characters: a width counted in code units misaligns this row's summary
+  ["wait", 320, "~/prj/kanji", "日本語のタイトル in a session title", "kanji-90"],
+  // over both crops, so the hard cut at 26 and 50 shows in a frame
   ["busy", 60, "~/prj/a-very-long-directory-name-that-does-not-fit",
-    "a summary that is definitely longer than fifty display cells in total"],
+    "a summary that is definitely longer than fifty display cells in total", "long-04"],
 ];
 
 function sample() {
-  // duck-typed: rank() and render() read shortPath, summary, state, since, pid, age and
-  // asking, which is what picks the ◆
-  return SAMPLE.map(([state, ago, shortPath, summary, asking = ""], n) => ({
-    pid: 1000 + n, state, summary, shortPath, asking, since: NOW - ago,
+  // duck-typed: rank() and render() read shortPath, summary, state, since, pid, age,
+  // asking; the resolver reads pid and name as well
+  return SAMPLE.map(([state, ago, shortPath, summary, name, asking = ""], n) => ({
+    pid: 1000 + n, state, summary, shortPath, name, asking, since: NOW - ago,
     age: ago < 60 ? `${ago}s`
       : ago < 3600 ? `${Math.floor(ago / 60)}m` : `${Math.floor(ago / 3600)}h`,
   }));
 }
 
-// ccx --snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast] [cursor=N] [offset=N]
-//
-// cursor= and offset= exist so the two things the default frame cannot show are reachable:
-// the cursor row's fill, and a table scrolled down. Both are colour, so they are the one
-// case where `plain` throws away what you came to look at.
+// A conversation with the shapes that break a renderer: a body under one line, one over it,
+// a hard newline, a word longer than any terminal, and two-cell characters.
+const CHAT_SAMPLE = [
+  {at: NOW - 7400, from: "ccx-ef", to: "ccx-85", body: "you own ccx and ccx_test.js " +
+    "outright from now until you hand them back. I am splitting claudes.js into five " +
+    "files right now, so code against the final map rather than what is on disk.",
+    msgId: "m1", sessionId: "s1"},
+  {at: NOW - 3600, from: "ccx-85", to: "ccx-ef", body: "ack", msgId: "m2", sessionId: "s2"},
+  {at: NOW - 900, from: "ccx-49", to: "all", body: "chat.js is in.\n" +
+    "the log is ~/.claude/chat/-Users-fserb-prj-ccx.jsonl, one message per line.",
+    msgId: "m3", sessionId: "s3"},
+  {at: NOW - 30, from: "ccx-85", to: "ccx-49", body: "日本語のタイトル, and a path with " +
+    "no break in it: /Users/fserb/prj/ccx/a-very-long-directory-name-that-does-not-fit-on-" +
+    "one-line-at-all/deeper", msgId: "m4", sessionId: "s4"},
+];
+
+// ccx --snapshot [chat] [<cols>x<rows>] [plain] [/<filter>] [empty] [toast] [cursor=N]
+//                 [offset=N]
+// cursor= and offset= reach the cursor row's fill and a scrolled table; both are colour,
+// so `plain` throws away what you came for. `chat` draws the chat view against CHAT_SAMPLE
+// and an `at` fixed against NOW, since a relative age off the clock is not reproducible
 function cmdSnapshot(...args) {
   let cols = 100, height = 14, plain = false, filter = "", rows = sample(), toast = null;
-  let cursor = 0, offset = 0;
+  let cursor = 0, offset = 0, chat = false;
   for (const a of args) {
     const wh = /^(\d+)x(\d+)$/.exec(a);
     const nm = /^(cursor|offset)=(\d+)$/.exec(a);
     if (wh) [cols, height] = [Number(wh[1]), Number(wh[2])];
     else if (nm) (nm[1] === "cursor" ? cursor = Number(nm[2]) : offset = Number(nm[2]));
     else if (a === "plain") plain = true;
+    else if (a === "chat") chat = true;
     else if (a === "empty") rows = [];
     else if (a === "toast") toast = "pid 1000 is not inside tmux; nothing to focus";
     else if (a.startsWith("/")) filter = a.slice(1);
@@ -513,14 +727,34 @@ function cmdSnapshot(...args) {
   }
   const needle = filter.trim().toLowerCase();
   const ranked = rank(rows, needle, SORTS[0]);
-  const frame = render({
-    ranked, total: rows.length, waiting: rows.filter((i) => i.state === "wait").length,
-    filter, needle, sort: SORTS[0], cursor, offset, toast, cols, height,
-  }).join("\n");
+  const frame = (chat
+    ? chatRender({cwd: "~/prj/ccx", msgs: rows.length ? CHAT_SAMPLE : [], offset, toast,
+      cols, height, now: NOW})
+    : render({
+      ranked, total: rows.length, waiting: rows.filter((i) => i.state === "wait").length,
+      filter, needle, sort: SORTS[0], cursor, offset, toast, cols, height,
+    })).join("\n");
   console.log(plain ? frame.replaceAll(SGR, "") : frame);
 }
 
-// --------------------------------------------------------------------------------- cli
+// ccx --resolve <target>[,<target>...] [self=N]
+// The resolver against --snapshot's fixed rows. `--ext js` covers the entry module only, so
+// ccx_test.js cannot import this file; a subprocess is how the frame is tested too
+function cmdResolve(...args) {
+  let spec = "", self = 0;
+  for (const a of args) {
+    const s = /^self=(\d+)$/.exec(a);
+    if (s) self = Number(s[1]);
+    else if (!spec) spec = a;
+    else return usage();
+  }
+  if (!spec) usage();
+  const {found, missed} = resolveTargets(sample(), spec, self);
+  for (const t of missed) console.log(`miss ${t}`);
+  for (const i of found) console.log(`${i.pid} ${i.name} ${i.shortPath}`);
+}
+
+// cli
 
 async function cmdList() {
   for (const i of new StateClock().update(await discover())) {
@@ -535,7 +769,7 @@ async function cmdDoctor() {
     `KITTY_WINDOW_ID=${Deno.env.get("KITTY_WINDOW_ID") ?? "(none)"}`);
   const pass = (await sh("tmux", "show", "-gv", "allow-passthrough")).trim();
   console.log(`tmux allow-passthrough: ${pass}`);
-  // the two per-platform pieces, so a box that jumps but stays silent says which
+  // the two per-platform pieces: a box that jumps but stays silent says which
   console.log(`platform ${Deno.build.os}  bell ${ringer()}  ` +
     `sound ${soundBytes().length}B of wav, straight from memory`);
   const records = sessionRecords();
@@ -562,18 +796,18 @@ async function cmdFocus(pid) {
 
 const BUNDLE = `${import.meta.dirname}/ccx.app`;
 
-// Deno.Tray is undefined under `deno run`, so this branch is both halves: with the
-// desktop globals it *is* the tray, without them it launches the bundle that has them.
-// The import is dynamic so the script path never loads systray.js at all.
+// Deno.Tray is undefined under `deno run`: with the desktop globals this *is* the tray,
+// without them it launches the bundle that has them. Dynamic import, or the script path
+// would load systray.js
 async function cmdSystray(...args) {
   if (typeof Deno.Tray === "function") {
     const {runSystray} = await import("./systray.js");
     await runSystray(args);
-    // deliberately never returns: runSystray() comes back as soon as the tray is up, so
-    // an exit here kills the app before an icon is drawn. systray.js owns quitting.
+    // never returns: runSystray() comes back as soon as the tray is up, and exiting here
+    // kills the app before an icon is drawn
     await new Promise(() => {});
   }
-  // the inner binary's name is fixed: CFBundleExecutable is literally `laufey_webview`
+  // fixed name: CFBundleExecutable is literally `laufey_webview`
   if (!(await Deno.stat(`${BUNDLE}/Contents/MacOS/laufey_webview`).catch(() => null))) {
     console.error("no ccx.app yet; run ./task build");
     Deno.exit(1);
@@ -581,9 +815,8 @@ async function cmdSystray(...args) {
   Deno.exit(await launch(args));
 }
 
-// Detached by LaunchServices (measured: ppid 1, no tty), never a plain exec of the inner
-// binary: that would die with this terminal or tmux pane. Never pass -n; a second `open`
-// activates the copy already running, and does not deliver the new args.
+// detached by LaunchServices (ppid 1, no tty); a plain exec of the inner binary would die
+// with this pane. Never -n: a second `open` activates the running copy, new args and all
 async function launch(args) {
   const {code} = await new Deno.Command("open", {
     args: ["-a", BUNDLE, "--args", "systray", ...args],
@@ -591,25 +824,180 @@ async function launch(args) {
   return code;
 }
 
+// targets
+
+// The instance we are running inside, or 0 outside one. Claude Code puts CLAUDE_PID in the
+// environment of every shell it spawns (2.1.273, read off a live one), so `all` can leave
+// us out for the price of an env read rather than a walk up the ppid chain.
+function selfPid() {
+  const pid = Number(Deno.env.get("CLAUDE_PID") ?? 0);
+  return Number.isInteger(pid) && pid > 0 ? pid : 0;
+}
+
+/* One target: `all`, a pid, a name, or a fuzzy match on the name or the path.
+ *
+ * Exact beats fuzzy, so a session actually named `ccx` is not outranked by another whose
+ * path merely holds those three letters. Matching more than one instance is the point of
+ * the feature and not an error; matching none is the only error resolution has.
+ */
+function resolveTarget(instances, target, self = 0) {
+  if (!target) return [];
+  if (target === "all") return instances.filter((i) => i.pid !== self);
+  if (/^\d+$/.test(target)) return instances.filter((i) => i.pid === Number(target));
+  const needle = target.toLowerCase();
+  const named = instances.filter((i) => i.name.toLowerCase() === needle);
+  if (named.length) return named;
+  const scored = [];
+  for (const i of instances) {
+    const hits = [fuzzy(needle, i.name), fuzzy(needle, i.shortPath)].filter((h) => h);
+    if (hits.length) scored.push([Math.min(...hits.map((h) => h.score)), i]);
+  }
+  return scored.sort((a, b) => a[0] - b[0] || a[1].pid - b[1].pid).map((p) => p[1]);
+}
+
+// Every target's matches, in the order the targets were written and each instance once: two
+// targets that name the same session send it one message, not two.
+function resolveTargets(instances, spec, self = 0) {
+  const found = [], missed = [], seen = new Set();
+  for (const t of spec.split(",").map((s) => s.trim()).filter((s) => s)) {
+    const hits = resolveTarget(instances, t, self);
+    if (!hits.length) missed.push(t);
+    for (const i of hits) {
+      if (seen.has(i.pid)) continue;
+      seen.add(i.pid);
+      found.push(i);
+    }
+  }
+  return {found, missed};
+}
+
+// `ccx list`'s shape: what happened, who to, where, and the detail. String.padEnd and not
+// display cells, like cmdList: a listing that is piped is columns, not a frame
+const sendLine = (verb, who, where, what) =>
+  `${verb.padEnd(6)} ${who.padEnd(12)} ${where.padEnd(30)} ${what}`;
+
+// ccx send <target>[,<target>...] <message...>
+async function cmdSend(...args) {
+  const [spec, ...words] = args;
+  const text = words.join(" ");
+  if (!spec || !text.trim()) usage();
+  const {found, missed} = resolveTargets(
+    new StateClock().update(await discover()), spec, selfPid());
+  if (!found.length) {
+    for (const t of missed) console.error(`send: no instance matches ${JSON.stringify(t)}`);
+    usage();
+  }
+  let sendPeer;
+  try {
+    ({sendPeer} = await peerModule());
+  } catch (e) {
+    console.error(`send: ${e.message ?? e}`);
+    Deno.exit(1);
+  }
+  // in flight together, reported in the order written: one target can fail while the others
+  // land, and a listing that arrives in completion order is unreadable
+  const errs = await Promise.all(found.map((i) => sendPeer(i, text)));
+  for (const t of missed) console.log(sendLine("failed", t, "-", "no instance matches"));
+  found.forEach((i, n) => console.log(errs[n]
+    ? sendLine("failed", i.name || String(i.pid), i.shortPath, errs[n])
+    : sendLine("sent", i.name || String(i.pid), i.shortPath, i.summary)));
+  if (missed.length || errs.some((e) => e)) Deno.exit(1);
+}
+
+// ccx chat [--no-follow]
+async function cmdChat(...args) {
+  let follow = true;
+  for (const a of args) {
+    if (a !== "--no-follow") usage();
+    follow = false;
+  }
+  let mod;
+  try {
+    mod = await chatModule();
+  } catch (e) {
+    console.error(`chat: ${e.message ?? e}`);
+    Deno.exit(1);
+  }
+  // colour only into a terminal, so a pipe carries the words and nothing else
+  const colour = Deno.stdout.isTerminal();
+  const width = Math.max(20, size().cols - 1);
+  const show = (m) => {
+    for (const runs of chatLines(m, width, Date.now() / 1000)) {
+      console.log(colour ? paint(runs, null) : runs.map((r) => r.t).join("").trimEnd());
+    }
+    console.log("");
+  };
+  for (const m of mod.chatLog(CWD)) show(m);
+  if (!follow) return;
+  mod.watchChat(CWD, show);
+  await new Promise(() => {});       // ctrl+c is the way out, the same as `tail -f`
+}
+
 const COMMANDS = {
   ui: [cmdUi, 0],
   list: [cmdList, 0],
   doctor: [cmdDoctor, 0],
   focus: [cmdFocus, 1],
+  send: [cmdSend, -1],               // -1: its own validation, since the message is the rest
+  chat: [cmdChat, -1],
   systray: [cmdSystray, -1],         // -1: passes its own flags through to the bundle
+  help: [cmdHelp, 0],
+  "-h": [cmdHelp, 0],
+  "--help": [cmdHelp, 0],
   "--snapshot": [cmdSnapshot, -1],
+  "--resolve": [cmdResolve, -1],
 };
 
+// one help line each: a [syntax, what it does] pair is drawn as a column, a string as it
+// is. The paragraphs are broken by hand, so nothing here has to measure the terminal
+const HELP = [
+  "usage: ccx <command> [args]",
+  "",
+  ["  (nothing)", "the listing, and enter to jump to an instance"],
+  ["  list", "the same listing, one line each, no UI"],
+  ["  doctor", "what resolves, and the kitty match it would use"],
+  ["  focus <pid>", "jump to an instance without the UI"],
+  ["  send <target> <message...>", "a chat message to one or more instances"],
+  ["  chat [--no-follow]", "what the agents here have said to each other"],
+  ["  systray", "the menu bar app, needs ./task build"],
+  ["  help", "this"],
+  "",
+  "a target is a pid, a session name, `all`, or a fuzzy match on the name or the path,",
+  "and `send` takes a comma-separated list of them",
+  "",
+  "in the TUI 1-0 and enter jump, esc quits, ^s changes the sort, ^t is the chat view,",
+  "and any other key filters the list",
+  "",
+  "two more belong to the tests: --snapshot [chat] [<cols>x<rows>] [plain] [/<filter>]",
+  "[empty] [toast] [cursor=N] [offset=N], and --resolve <target>[,<target>...] [self=N]",
+];
+
+// colour only into a terminal, so a pipe carries the words and nothing else. paint() ends
+// on a RESET, which is what leaves the description in the terminal's own colour
+function helpText(colour) {
+  const pad = Math.max(...HELP.filter(Array.isArray).map(([k]) => k.length)) + 2;
+  return HELP.map((line) => {
+    if (!Array.isArray(line)) return line;
+    const [key, what] = line;
+    const gap = " ".repeat(pad - key.length);
+    return (colour ? paint([{t: key, c: PALETTE.accent, b: true}], null) : key) + gap +
+      what;
+  }).join("\n");
+}
+
+// `ccx help` is stdout and 0; a bad argument list is the same text on stderr and 2, and
+// the tests read its first line, so `usage: ccx` has to stay the start of it
+function cmdHelp() {
+  console.log(helpText(Deno.stdout.isTerminal()));
+}
+
 function usage() {
-  console.error("usage: ccx [list | doctor | focus <pid> | systray | " +
-    "--snapshot [<cols>x<rows>] [plain] [/<filter>] [empty] [toast] " +
-    "[cursor=N] [offset=N]]");
+  console.error(helpText(Deno.stderr.isTerminal()));
   Deno.exit(2);
 }
 
-// Everything but `systray` runs as this script and never through the built binary: the
-// desktop runtime prints two lines to stdout before any user code, which would land
-// ahead of a listing. Do not "simplify" this into always execing the app.
+// everything but `systray` runs as this script, never the bundle: the desktop runtime
+// prints two lines to stdout before user code, ahead of a listing. Do not always exec
 const [name = "ui", ...rest] = Deno.args;
 const cmd = COMMANDS[name];
 if (!cmd || (cmd[1] >= 0 && rest.length !== cmd[1])) usage();

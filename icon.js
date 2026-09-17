@@ -1,28 +1,23 @@
 // The menu bar icon: one dot per instance, and the PNG encoder that draws it.
 // Deno's tray takes PNG bytes and not a path, so nothing here writes a file.
 
-// ------------------------------------------------------------------------- the look
-
 const ICON = 18;            // square, inside the menu bar's 22pt, with room to breathe
 const MIN_GRID = 2;         // 2x2 is the smallest; one dot filling the icon is a blob
 const FILL = 0.62;          // how much of its cell a dot takes across
 const WAIT_FILL = 0.80;     // except a `wait` dot, which is bigger so it is the one you see
 
-// Not the panel's colors; the menu bar's background is the desktop. Luminance .58 and
-// .26, both under the gold's .69. free is flat rather than translucent so it survives a
-// light bar, where a 45% white would vanish.
+// Not the panel's colors; the menu bar's background is the desktop. Luminance .58 and .26,
+// both under the gold's .69. free is flat rather than translucent, so it survives a light
+// bar, where a 45% white would vanish.
 const DOTS = {wait: [0xff, 0xd5, 0x00], busy: [0xc8, 0xc8, 0xc8]};
 const FREE = [0x8c, 0x8c, 0x8c];
 
 const SS = 8;               // samples per pixel edge, so 64 levels of coverage on a rim
 const RING = 1.2;           // pt, the stroke for the no-instances ring
 
-// ------------------------------------------------------------------------ the layout
-
-// Where a dot per state goes in a `box`-sized square, as {cx, cy, r}, cy from the top.
-// What is centered is the BLOCK OF CELLS THE DOTS USE, not the whole grid and not each
-// row on its own; centering rows individually reads as a triangle rather than a grid with
-// a hole. See `## The icon` in CLAUDE.md for the rest of the argument and the numbers.
+// Where a dot per state goes in a `box`-sized square, as {cx, cy, r}, cy from the top. What
+// is centered is the BLOCK OF CELLS THE DOTS USE, not the whole grid and not each row on
+// its own: centering rows individually reads as a triangle, not a grid with a hole.
 export function iconDots(states, box = ICON) {
   const shown = Math.max(states.length, 1);
   const grid = Math.max(MIN_GRID, Math.ceil(Math.sqrt(shown)));
@@ -42,14 +37,10 @@ export function iconDots(states, box = ICON) {
   return spots;
 }
 
-// --------------------------------------------------------------------- the rasterizer
-
-// Paint the ring between `inner` and `outer` radius, source-over, into an RGBA buffer.
-//
-// A disc is this with inner 0, which is what keeps one function drawing both shapes.
-// Coverage is an SSxSS grid of samples per pixel rather than an analytic area: at these
-// sizes the difference is under a level of alpha and the sampler is four lines. Only the
-// dot's bounding box is walked, so the cost is the ink and not the canvas.
+// Paint the ring between `inner` and `outer` radius, source-over, into an RGBA buffer; a
+// disc is this with inner 0. Coverage is an SSxSS sample grid rather than an analytic area:
+// at these sizes the difference is under a level of alpha. Only the dot's bounding box is
+// walked, so the cost is the ink and not the canvas.
 function stamp(rgba, px, cx, cy, outer, inner, color) {
   const [r, g, b] = color;
   const o2 = outer * outer, i2 = inner * inner;
@@ -66,9 +57,8 @@ function stamp(rgba, px, cx, cy, outer, inner, color) {
         }
       }
       if (!hit) continue;
-      // straight alpha and not premultiplied, which is what a PNG carries. The dots never
-      // touch, so the blend only ever runs over transparency; it is here so that a future
-      // overlap is a dimmer dot rather than a hole punched in the one underneath
+      // straight alpha, not premultiplied, which is what a PNG carries: a future overlap
+      // is then a dimmer dot rather than a hole punched in the one underneath
       const a = hit / (SS * SS), at = (y * px + x) * 4;
       const keep = (rgba[at + 3] / 255) * (1 - a);
       const out = a + keep;
@@ -97,8 +87,6 @@ export function iconPng(states, scale = 2) {
   return png(px, px, rgba);
 }
 
-// -------------------------------------------------------------------- the PNG encoder
-
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -115,7 +103,7 @@ function crc32(bytes) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// One PNG chunk: length, type, data, and a CRC over the type and the data together.
+// The CRC covers the type and the data together.
 function chunk(type, data) {
   const out = new Uint8Array(12 + data.length);
   const view = new DataView(out.buffer);
@@ -129,9 +117,9 @@ function chunk(type, data) {
 const BYTES = new TextEncoder();
 const SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
 
-// `w` by `h` straight-alpha RGBA bytes as a PNG: 8-bit, one IHDR, one IDAT, one IEND.
-// IDAT wants a zlib stream, which is what "deflate" produces; "deflate-raw" omits the
-// header and would make the file unreadable rather than throw.
+// `w` by `h` straight-alpha RGBA bytes as a PNG. IDAT wants a zlib stream, which is what
+// "deflate" produces; "deflate-raw" omits the header and would make the file unreadable
+// rather than throw.
 export async function png(w, h, rgba) {
   const stride = w * 4 + 1;
   const raw = new Uint8Array(stride * h);

@@ -1,24 +1,21 @@
 /* The menu bar app: a tray icon of one dot per instance, and a panel that lists them.
+ * The model is the platform-free half; the page is a dumb renderer handed state to paint.
  *
- * The model is the platform-free half (the poll, the filter, the cursor, what each key
- * means); the page is a dumb renderer that captures keys and is handed state to paint.
- *
- * Deno.Tray, Deno.BrowserWindow and Deno.dock exist only inside a built app, never under
- * `deno run`, so they are reached through one cast and guarded on `typeof`.
+ * Deno.Tray, Deno.BrowserWindow and Deno.dock are undefined under `deno run` and exist only
+ * inside a built app, so they are reached through one cast and guarded on `typeof`.
  */
 
-import {
-  discover, jump, loadBell, NUMBERS, PALETTE, play, rank, StateClock, stateOf, MAC, fuzzy,
-} from "./claudes.js";
+import {MAC} from "./sh.js";
+import {discover, StateClock} from "./claudes.js";
+import {fuzzy, NUMBERS, PALETTE, rank, stateOf} from "./view.js";
+import {jump} from "./jump.js";
+import {loadBell, play} from "./bell.js";
 import {iconPng} from "./icon.js";
 
 const POLL = 1500;          // same cadence as the TUI, so the bell lands as promptly
 
-// ------------------------------------------------------------------------- the look
-
-// Points on macOS and logical pixels on Wayland were close enough to the same size that
-// the Python laid both panels out on these numbers; CSS pixels are the third thing that
-// is the same size, so they carry over unchanged.
+// macOS points, Wayland logical pixels and CSS pixels are close enough to the same size
+// that these numbers carry across the three.
 const WIDTH = 620;
 const ROW = 24;             // one instance
 const HEAD = 26;            // the filter line
@@ -28,11 +25,8 @@ const MAX_ROWS = 12;        // past this the panel is taller than it is useful; 
 const HINTS = "1-0/enter jump   esc close";
 const OFF = -20000;         // where a closed panel is parked, since it is never hidden
 
-// ------------------------------------------------------------------- the global hotkey
-
-// Carbon's RegisterEventHotKey is the one global-shortcut API that needs neither an
-// Accessibility grant nor anything of the user, and it survives the move into a built app:
-// both calls return noErr from inside one. 0x26 is the J key, a US-layout virtual code.
+// Carbon's RegisterEventHotKey is the one global-shortcut API that needs no Accessibility
+// grant, and both calls return noErr from inside a built app. 0x26 is J, a US virtual code.
 const CARBON = "/System/Library/Frameworks/Carbon.framework/Carbon";
 const CMD = 0x0100, OPTION = 0x0800, CONTROL = 0x1000;
 const HOTKEY = {code: 0x26, mods: CONTROL | OPTION | CMD};
@@ -41,37 +35,27 @@ const REPEAT_GAP = 250;     // holding the keys repeats the event; six in a seco
 const TOGGLE_GAP = 250;     // how long a close is remembered, so the click that closed the
                             // panel does not read as the click that opens it again
 
-// The ctypes callback lived in a module global for this reason and so does this one:
-// Carbon keeps a raw pointer, so a collected callback is a crash later, not an error now.
+// Module global: Carbon keeps a raw pointer, so a collected callback is a crash later, not
+// an error now.
 let HOTKEY_HANDLER = null;
 
-/* Register the hotkey. `fn` is SCHEDULED and never called in the handler, and that is the
- * whole of what makes the hotkey work rather than kill the app.
+/* `fn` is SCHEDULED and never called in the handler, and that is the whole of what makes
+ * the hotkey work rather than kill the app.
  *
- * Carbon runs the handler on the AppKit main thread. Deno runs an UnsafeCallback invoked
- * from a foreign thread on its own JS thread and BLOCKS THE CALLER until it returns. The
- * READING calls go the other way: `tray.getBounds()` is `dispatch_sync` onto the main
- * queue (so is `panel.isVisible()`, and so is every other getter), which blocks the JS
- * thread until the main thread runs it. So a `fn()` here is a deadlock on the first
- * `tray.getBounds()` inside `show()`: main waits for JS, JS waits for main, and the app is
- * gone for good with no panel, no response to a click, no exception and no crash report.
- * Read off `sample` on a frozen one: main in DispatchEventToHandlers ->
- * _dispatch_semaphore_wait_slow, the JS thread in laufey_common::GetTrayIconBoundsMac ->
- * __DISPATCH_WAIT_FOR_QUEUE__. Measured in a built probe with the callback pushed onto the
- * main queue by `dispatch_async_f`: calling `getBounds()` inside it froze both threads at
- * the call and the 200ms heartbeat stopped in the same millisecond, while scheduling
- * returned from the handler in 1ms, read the bounds 2ms later and left the poll ticking.
- * The writing calls (`setPosition`, `focus`, `setSize`, `executeJs`, `setIcon`) are
- * `dispatch_async` and would have been safe, which is why this looks like it should work.
+ * Carbon runs the handler on the AppKit main thread, and Deno BLOCKS THAT CALLER until the
+ * UnsafeCallback returns. The READING calls go the other way: `tray.getBounds()`,
+ * `panel.isVisible()` and every other getter are `dispatch_sync` onto the main queue, which
+ * blocks the JS thread until the main thread runs them. So `fn()` here deadlocks on the
+ * first `getBounds()` inside `show()`, and the app is gone for good with no panel, no
+ * response to a click, no exception and no crash report. The writing calls (`setPosition`,
+ * `focus`, `setSize`, `executeJs`, `setIcon`) are `dispatch_async` and would have been safe,
+ * which is why this looks like it should work.
  *
- * `setTimeout` is enough because the body already runs on the JS thread: it turns the
- * AppKit work into an ordinary task that starts once the handler has returned and the main
- * thread is free again. A MICROTASK IS NOT ENOUGH, so this may not become an `await` or an
- * async handler: deno_core runs the microtask checkpoint before it releases the foreign
- * thread, measured at 200.1ms of blocked main thread for a `.then()` doing 200ms of work
- * against 0.1ms for this. It is also what the tray's own click gets for nothing, and why
- * `toggle()` is safe from there and not from here: a click arrives as an event on a
- * channel that the JS event loop drains, with no main thread waiting on it.
+ * A MICROTASK IS NOT ENOUGH, so this may not become an `await` or an async handler:
+ * deno_core runs the microtask checkpoint before it releases the foreign thread, measured at
+ * 200.1ms of blocked main thread for a `.then()` doing 200ms of work against 0.1ms for this.
+ * The tray's own click gets that for nothing, which is why `toggle()` is safe from there: a
+ * click arrives on a channel the JS event loop drains, with no main thread waiting on it.
  */
 function registerHotkey(fn) {
   if (!MAC) return "no global hotkey outside macOS";
@@ -113,29 +97,22 @@ function registerHotkey(fn) {
   return err ? `RegisterEventHotKey failed: ${err}` : "";
 }
 
-// --------------------------------------------------------------- the icon keeps its color
-
 /* Make the menu bar image draw in our own colors, which Deno's tray will not.
  *
  * `tray.setIcon` reaches laufey_common::SetTrayIconMac, whose ImageFromPng hardcodes
- * `[img setSize:18x18]; [img setTemplate:YES]` (`mov w2, #0x1`, read out of the binary).
- * There is no flag and no second argument, and setIconDark goes through the same function.
- * macOS draws a template as one flat tint, so the gold is thrown away before it is ever on
- * screen.
- *
- * Undoing that is two things, and neither one is enough on its own:
- *  - CLEAR THE FLAG, but not in the turn that set the icon. SetTrayIconMac builds the
- *    image inside a block it dispatch_asyncs onto the main queue, so setIcon returns
- *    before the button has it and a clear in the same turn clears the image being
- *    replaced; at startup it is worse, since the status item is not in `[NSApp windows]`
- *    at all until ~72ms after `new Tray()`. An image that is still marked is the signal
- *    that Deno's block has run, so that is what `recolor` waits for.
+ * `[img setSize:18x18]; [img setTemplate:YES]` (read out of the binary), with no flag and no
+ * second argument; setIconDark is the same function. macOS draws a template as one flat
+ * tint, so the gold is thrown away before it is ever on screen. Undoing it needs both of:
+ *  - CLEAR THE FLAG, but never in the turn that set the icon. SetTrayIconMac builds the
+ *    image inside a block it dispatch_asyncs, so a clear in the same turn clears the image
+ *    being replaced, and at startup the status item is not in `[NSApp windows]` at all
+ *    until ~72ms after `new Tray()`. A still-marked image is the signal that Deno's block
+ *    has run, so that is what `recolor` waits for.
  *  - MAKE THE BUTTON DRAW AGAIN. Clearing the flag on the live image repaints nothing
- *    (measured: pixel-identical screenshots). `setImage:` does, and it has to go through
+ *    (measured: pixel-identical screenshots). `setImage:` does, through
  *    performSelectorOnMainThread:, since Deno's JS thread is not AppKit's main thread.
- * Deno's own image is kept rather than replaced by one of ours, so the re-apply that
- * follows an AppleInterfaceThemeChangedNotification hands the button back the same
- * un-templated object instead of a fresh marked one.
+ * Deno's own image is kept rather than replaced by one of ours, so the re-apply after an
+ * AppleInterfaceThemeChangedNotification hands back the same un-templated object.
  */
 let OBJC = null;
 
@@ -195,12 +172,8 @@ function statusButton() {
   return null;
 }
 
-/* Take the template flag off the image the last `setIcon` put on the button, and make the
- * button draw it again. Retries while the item is unplaced or Deno's block has not run.
- *
- * `stale` says a newer icon is on its way, which is what keeps a retry from painting a
- * listing that has moved on.
- */
+// Retries while the item is unplaced or Deno's block has not run. `stale` says a newer icon
+// is on its way, which keeps a retry from painting a listing that has moved on.
 function recolor(stale, tries = 0) {
   try {
     if (stale()) return;
@@ -220,13 +193,9 @@ function recolor(stale, tries = 0) {
   }
 }
 
-// ------------------------------------------------------------------------- the model
-
-/* The listing, the filter, the cursor, and what each key means.
- *
- * The three hooks are how it reaches back into a UI it knows nothing about: `redraw` when
- * what is on screen has changed, `close` to put the panel away, `quit` to leave for good.
- */
+// The listing, the filter, the cursor, and what each key means. The three hooks are how it
+// reaches back into a UI it knows nothing about: `redraw` when the screen has changed,
+// `close` to put the panel away, `quit` to leave for good.
 class Model {
   constructor(redraw, close, quit) {
     this.clock = new StateClock();
@@ -241,12 +210,9 @@ class Model {
     this.quit = quit;
   }
 
-  // ---- the listing
-
-  /* One poll. discover() is async, so the interval no longer waits for the poll it
-   * started; the guard drops the next tick rather than letting two land out of order and
-   * paint the older listing. This is the thing that runs all day, so it also owns the bell.
-   */
+  // discover() is async, so the interval does not wait for the poll it started; the guard
+  // drops the next tick rather than letting two land out of order and paint the older
+  // listing. This is the thing that runs all day, so it also owns the bell.
   async poll() {
     if (this.polling) return;
     this.polling = true;
@@ -268,9 +234,8 @@ class Model {
     this.redraw();
   }
 
-  // What is actually matched: the filter with its ends trimmed. A leading space is how you
-  // search for something starting with a digit, since a digit typed into an *empty* filter
-  // picks a row instead.
+  // A leading space is how you search for something starting with a digit, since a digit
+  // typed into an *empty* filter picks a row instead.
   get needle() {
     return this.filter.trim().toLowerCase();
   }
@@ -280,19 +245,13 @@ class Model {
     return found ? found.idx : [];
   }
 
-  /* What the icon draws: every instance's state, in the order the rows go in.
-   *
-   * Rank order fills the grid, which puts every `wait` dot first: the icon is for telling
-   * you at a glance that something wants you, and reading an exact number off a menu bar
-   * was never the point.
-   */
+  // What the icon draws. Rank order puts every `wait` dot first: the icon is for seeing at
+  // a glance that something wants you, not for reading an exact number off a menu bar.
   states() {
     return rank(this.instances).map((i) => i.state);
   }
 
-  // ---- what the panel says
-
-  // The head line's right-hand count, and its color. Gold when something waits.
+  // Gold when something waits.
   counter() {
     const waiting = this.instances.filter((i) => i.state === "wait").length;
     if (this.filter) {
@@ -321,8 +280,7 @@ class Model {
     return PAD + HEAD + rows * ROW + FOOT + PAD;
   }
 
-  // Everything the page paints, in one object. This is the drawRect_ of the HTML backend:
-  // the model says what is on screen and the page decides nothing.
+  // Everything the page paints, in one object: the page decides nothing.
   view() {
     return {
       filter: this.filter,
@@ -348,16 +306,9 @@ class Model {
     };
   }
 
-  // ---- the cursor and the jump
-
-  /* Called every time the panel comes up: a fresh filter, no stale error, and the cursor
-   * back on the top row.
-   *
-   * Dropping `selected` is what puts it there: `refresh` only moves the cursor when the pid
-   * under it is gone, so without this the panel comes up on whatever row you left it on,
-   * which is the wrong row now that the ranking has been redone. The TUI keeps its cursor
-   * for the opposite reason: it stays open and you watch the rows move under it.
-   */
+  // Called every time the panel comes up. Dropping `selected` is what puts the cursor back
+  // on the top row: `refresh` only moves it when the pid under it is gone, so otherwise the
+  // panel comes up on whatever row you left, which the re-ranking has moved.
   opened() {
     this.filter = "";
     this.error = "";
@@ -377,12 +328,9 @@ class Model {
     this.redraw();
   }
 
-  /* Focus that instance and put the panel away.
-   *
-   * Unlike the TUI, jumping closes: this is a launcher you called up to leave, not a window
-   * you are already sitting in. A jump that failed says so instead of closing, since a
-   * panel that vanished having done nothing is indistinguishable from one that worked.
-   */
+  // Jumping closes the panel, unlike the TUI: this is a launcher you called up in order to
+  // leave. A jump that failed says so instead, since a panel that vanished having done
+  // nothing looks like one that worked.
   async jumpRow(row) {
     if (!(row >= 0 && row < Math.min(this.rows.length, MAX_ROWS))) return;
     this.selected = this.rows[row].pid;
@@ -395,16 +343,8 @@ class Model {
     this.close();
   }
 
-  // ---- the keyboard
-
-  /* One keystroke. `name` is set for the keys that are not text, `char` otherwise.
-   *
-   * A digit typed into an *empty* filter picks that row. Once the filter has anything in it
-   * a digit is just another filter character, and a leading space is how you search for
-   * something that starts with one. Escape only closes the panel: the panel is something
-   * the app shows, so leaving it is not leaving, and "quit" is the one key that ends the
-   * process.
-   */
+  // One keystroke: `name` for the keys that are not text, `char` otherwise. A digit picks a
+  // row only while the filter is empty. Escape closes the panel, "quit" ends the process.
   key(name = "", char = "") {
     if (name === "escape") this.close();
     else if (name === "quit") this.quit();
@@ -422,14 +362,10 @@ class Model {
   }
 }
 
-// -------------------------------------------------------------------------- the page
-
-/* The panel, as one HTML document served off loopback. Five columns at fixed offsets, so
- * it lines up with the TUI. The path truncates at its HEAD, which keeps the part that
- * identifies it; `direction: rtl` on the box is how CSS spells that.
- *
- * The state is embedded in the document as well as pushed in afterwards, so the page is
- * never blank: point a browser at the same URL and it paints the real listing.
+/* The panel, as one HTML document served off loopback. Five columns at fixed offsets, so it
+ * lines up with the TUI. The state is embedded in the document as well as pushed in
+ * afterwards, so the page is never blank: point a browser at the same URL and it paints the
+ * real listing.
  */
 const PAGE = `<!doctype html>
 <meta charset="utf-8">
@@ -473,8 +409,7 @@ html, body {
 <script>
 const $ = (id) => document.getElementById(id);
 
-// One field, with the fuzzy match's characters picked out in the accent color. Built as
-// nodes rather than markup so a path or a summary can hold anything at all.
+// Built as nodes rather than markup, so a path or a summary can hold anything at all.
 function field(cls, string, color, hits) {
   const box = document.createElement("span");
   box.className = cls;
@@ -523,9 +458,8 @@ function ccx(state) {
   }
 }
 
-// The keys the model answers to, in the browser's spelling. cmd+q and ctrl+q both arrive
-// as "q" here: the AppKit backend had to read charactersIgnoringModifiers because ctrl+q
-// reached it as \\x11, and a KeyboardEvent has no such problem.
+// The keys the model answers to, in the browser's spelling. cmd+q, ctrl+q and cmd+Q all
+// arrive as "q", so the modifier cannot be required.
 const NAMED = {Escape: "escape", Enter: "enter", Backspace: "backspace",
   ArrowDown: "down", ArrowUp: "up"};
 
@@ -547,42 +481,32 @@ $("rows").addEventListener("mousedown", (e) => {
 </script>
 `;
 
-// `<` is escaped out of the state so a path or a summary holding "</script>" cannot end
-// the tag it is embedded in.
+// `<` is escaped so a path or a summary holding "</script>" cannot end the embedding tag.
 function json(view) {
   return JSON.stringify(view).replaceAll("<", "\\u003c");
 }
 
-// The document with the current listing already painted into it.
 function pageWith(view) {
   return `${PAGE}<script>ccx(${json(view)})</script>\n`;
 }
 
-// ---------------------------------------------------------------------------- the app
-
-// The desktop globals are not in Deno's types, and they are absent under `deno run`.
+// not in Deno's types
 const desktop = /** @type {any} */ (Deno);
 
 /* Close the window the first `BrowserWindow` adopted, as soon as the panel is up.
  *
- * CLOSE AND NOT HIDE. `hide()` on it is not durable: it takes (`isVisible()` goes false
- * and the window leaves the screen), and then the runtime puts it back up ~5s later and it
- * stays for the life of the app, still on screen at 65s, buried a dozen windows deep where
- * it is easy to miss. `close()` holds: `isClosed` is true at 10s and 20s and the window is
- * gone from the CG list entirely. A poll of ours is not what re-shows it; a probe with no
- * poll, no setIcon and no setSize does the same.
+ * CLOSE AND NOT HIDE. `hide()` on it is not durable: it takes, and then the runtime puts it
+ * back up ~5s later and it stays for the life of the app, still there at 65s, buried a dozen
+ * windows deep. `close()` holds: `isClosed` at 10s and 20s, and gone from the CG list. It
+ * also does not need the window ordered in first, which `hide()` does, so nothing waits for
+ * the runtime's ~250ms order-in and the adopted window never reaches the screen; waiting for
+ * it cost a 130-140ms flash of a blank 800x628 window over three runs.
  *
- * `close()` also does not need the window ordered in first, which `hide()` does, so
- * nothing here waits for the runtime's ~250ms order-in and the adopted window never
- * reaches the screen at all. Waiting for it cost a 130-140ms flash of a blank 800x628
- * window, measured over three runs.
- *
- * The one thing that IS waited for is the panel, because DISPOSING OF THE LAST VISIBLE
- * WINDOW ENDS THE PROCESS: status 0, no exception, no crash report, and the next timer
- * never runs. That is the real rule behind "hide() kills the app", and it is about the
- * window being the last one and not about it being borderless. The panel is visible at
- * 78-110ms, well before the adopted window is. The deadline is there so a runtime that
- * never shows the panel costs a second at startup instead of hanging.
+ * The panel IS waited for, because DISPOSING OF THE LAST VISIBLE WINDOW ENDS THE PROCESS:
+ * status 0, no exception, no crash report, and the next timer never runs. That is the real
+ * rule behind "hide() kills the app", and it is about the window being the last one and not
+ * about it being borderless. The panel is visible at 78-110ms. The deadline bounds a runtime
+ * that never shows it, instead of hanging.
  */
 async function closeAdopted(adopted, panel) {
   const deadline = Date.now() + 4000;
@@ -592,10 +516,9 @@ async function closeAdopted(adopted, panel) {
   adopted.close();
 }
 
-/* Put the panel under the tray icon, right-aligned to it. getBounds is only meaningful
- * once the item has been placed: at construction it reads {x: 8, y: 1106} and at the
- * first show {x: 1008, y: 5}, which is why this is a callback and not read once.
- */
+// Under the tray icon, right-aligned to it. getBounds is only meaningful once the item has
+// been placed: at construction it reads {x: 8, y: 1106}, at the first show {x: 1008, y: 5},
+// which is why this is a callback and not read once.
 function place(bounds) {
   return {
     x: Math.round(Math.max(8, bounds.x + bounds.width - WIDTH)),
@@ -603,11 +526,7 @@ function place(bounds) {
   };
 }
 
-/* The menu bar app. Never returns; the OS ends it.
- *
- * Returns 1 without starting anything when the desktop globals are missing, which is every
- * way of running this other than the built app.
- */
+// Never returns; the OS ends it. Returns 1 without starting anything under `deno run`.
 export async function runSystray(argv = Deno.args) {
   if (typeof desktop.Tray !== "function") {
     console.error("the systray is the built app: ./task build, then ccx systray");
@@ -628,10 +547,8 @@ export async function runSystray(argv = Deno.args) {
 
   const tray = new desktop.Tray();
   tray.setTooltip("ccx");
-  // The only menu the app has, and the only way out other than the panel's own quit key: a
-  // menu bar app with no window has nowhere else to put it. It opens on right click, which
-  // the OS reserves and never reports, so nothing here can open it and nothing has to
-  // suppress it on a left click the way the AppKit version did.
+  // The only way out other than the panel's own quit key. It opens on right click, which
+  // the OS reserves and never reports, so nothing here can open or suppress it.
   tray.setMenu([
     {item: {id: "about", label: `ccx  ·  ${HOTKEY_NAME}`, enabled: false,
       accelerator: null, checked: false, tooltip: null}},
@@ -641,34 +558,26 @@ export async function runSystray(argv = Deno.args) {
   ]);
   tray.onmenuclick = () => model.quit();   // Quit is the only thing in it that can be hit
 
-  /* The panel is a window we own, shown, hidden and placed by hand.
+  /* The panel is a window we own, shown, hidden and placed by hand. `tray.attachPanel` is
+   * documented as the menu bar popover primitive and in 2.9.6 is not one: a plain titled
+   * window with traffic lights, ignoring both the icon's position and the creation options.
    *
-   * `tray.attachPanel` is documented as the menu bar popover primitive and in 2.9.6 it is
-   * not one: it gives a plain titled window with traffic lights on it, and it ignores both
-   * the icon's position and the creation options that would make it a panel. Owning the
-   * window is the same three methods the AppKit version had, for the same reasons.
-   *
-   * TWO THINGS ABOUT IT ARE NOT GUESSABLE, and both were read off the live NSWindow's
-   * styleMask through objc_msgSend rather than inferred from how it looks (titled is bit 0,
-   * so mask 0 is borderless and 7 and 15 are not).
-   *
-   * THE RUNTIME OPENS ONE WINDOW AT STARTUP AND THE FIRST `BrowserWindow` ADOPTS IT. That
-   * one is an ordinary titled window whatever options it is handed, mask 7, which is where
-   * the traffic lights came from. The *second* one built in the same process is a
-   * `LaufeyKeyableWindow` at mask 0: borderless, and still `canBecomeKeyWindow`, which is
-   * the NSPanel subclass the AppKit version had to write by hand. So the startup window is
-   * taken and closed, and the panel is built second. `deno desktop` points that window at
-   * our own `Deno.serve` address, so left alone it sits there showing the listing: an
-   * 800x628 copy of the panel with traffic lights on it. `closeAdopted` says why closing
-   * is the only thing that disposes of it.
-   *
-   * The option set is not the obvious one either. `frameless` ALONE IS IGNORED, mask 15; it
-   * only bites together with `resizable: false`. `noActivate` is a trap rather than the
-   * answer: it gives mask 128, NSWindowStyleMaskNonactivatingPanel, and takes
-   * `canBecomeKeyWindow` to 0, so the panel can no longer be typed into. And every option
-   * goes to the constructor with nothing configured afterwards, since the mask is applied
-   * asynchronously and a later setter undoes it: `alwaysOnTop` in the constructor keeps
-   * mask 0, `setAlwaysOnTop(true)` called after it drops back to 7.
+   * TWO THINGS ARE NOT GUESSABLE, both read off the live NSWindow's styleMask through
+   * objc_msgSend (titled is bit 0, so mask 0 is borderless and 7 and 15 are not):
+   *  - THE RUNTIME OPENS ONE WINDOW AT STARTUP AND THE FIRST `BrowserWindow` ADOPTS IT, an
+   *    ordinary titled window at mask 7 whatever options it is handed, which is where the
+   *    traffic lights came from. The *second* one in the same process is a
+   *    `LaufeyKeyableWindow` at mask 0: borderless and still `canBecomeKeyWindow`. `deno
+   *    desktop` points the startup window at our own `Deno.serve` address, so left alone it
+   *    sits there as an 800x628 copy of the panel. So it is taken and closed, and the panel
+   *    is built second; `closeAdopted` says why closing is the only thing that disposes of
+   *    it.
+   *  - `frameless` ALONE IS IGNORED, mask 15; it only bites together with `resizable:
+   *    false`. `noActivate` is a trap: mask 128, NSWindowStyleMaskNonactivatingPanel, which
+   *    takes `canBecomeKeyWindow` to 0 and the panel can no longer be typed into. Every
+   *    option goes to the constructor, since the mask is applied asynchronously and a later
+   *    setter undoes it: `alwaysOnTop` in the constructor keeps mask 0, `setAlwaysOnTop`
+   *    called after it drops back to 7.
    */
   const adopted = new desktop.BrowserWindow();   // the startup window, taken off our hands
 
@@ -685,22 +594,17 @@ export async function runSystray(argv = Deno.args) {
   let open = false;          // whether the panel is up; the window cannot be asked
   let hiddenAt = 0;          // when the panel last went away, for the toggle's memory
 
-  /* Closing the panel PARKS IT OFF SCREEN AND NEVER HIDES IT, which reads as a silly thing
-   * to do and is not: `panel.hide()` on the frameless window KILLS THE APP. The call
-   * returns, the line after it runs, and the process is gone with status 0 before the next
-   * timer fires: no exception, no crash report, no `unload`, and a wrapped `Deno.exit`
-   * never sees it, so it is AppKit tearing the app down and not anything in JS. It is
-   * specific to the borderless second window; `hide()` on the adopted startup window above
-   * is fine, which is what makes this so easy to "fix" back into a menu bar app that dies a
-   * few seconds after launch.
-   *
-   * So `isVisible()` is true for the whole life of the process and cannot answer whether
-   * the panel is up. `open` is what answers that, and `onblur` is what closes it.
+  /* Closing the panel PARKS IT OFF SCREEN AND NEVER HIDES IT: `panel.hide()` on the
+   * frameless window KILLS THE APP. The call returns, the line after it runs, and the
+   * process is gone with status 0 before the next timer fires, with no exception, no crash
+   * report, no `unload`, and a wrapped `Deno.exit` never sees it. It is specific to the
+   * borderless second window; `hide()` on the adopted startup window above is fine. So
+   * `isVisible()` is true for the whole life of the process and cannot answer whether the
+   * panel is up: `open` answers that, and `onblur` is what closes it.
    */
   function show() {
     // getBounds is a drifting placeholder at x=8 for the first ~400ms after the tray is
-    // constructed and only then settles to where the item really is, so it is read here,
-    // at the moment it is needed, and never once at setup
+    // constructed, so it is read here, at the moment it is needed, and never once at setup
     const at = place(tray.getBounds());
     panel.setPosition(at.x, at.y);
     panel.focus();
@@ -715,14 +619,11 @@ export async function runSystray(argv = Deno.args) {
     hiddenAt = Date.now();
   }
 
-  /* One toggle for the menu bar icon and the hotkey both.
-   *
-   * Clicking the icon while the panel is up makes the status bar key, so the panel blurs
-   * and hides before the button action runs. Without the memory that click reads as "it is
-   * closed, open it" and the panel flickers shut and straight back open. The hotkey arrives
-   * with the panel still key and does not have the problem, and goes through the same door
-   * anyway.
-   */
+  // One toggle for the icon and the hotkey both. Clicking the icon while the panel is up
+  // makes the status bar key, so the panel blurs and hides before the button action runs;
+  // without the memory that click reads as "it is closed, open it" and the panel flickers
+  // shut and straight back open. The hotkey arrives with the panel still key and does not
+  // have the problem.
   function toggle() {
     if (open) return close();
     if (Date.now() - hiddenAt < TOGGLE_GAP) return;   // this click is what blurred it
@@ -733,19 +634,15 @@ export async function runSystray(argv = Deno.args) {
 
   // Not a line earlier: the panel blurs while this waits, `onblur` runs `close()`, and
   // `close` reads `open`. Awaiting above that `let` put the read in the temporal dead zone,
-  // and the ReferenceError came out of an event handler, where it is uncaught and ends the
-  // process. Launched from a terminal the blur never arrived and it looked fine; launched
-  // by LaunchServices, which is how `ccx systray` starts it, the app died at ~300ms every
-  // time.
+  // and the ReferenceError came out of an event handler, uncaught, ending the process. From
+  // a terminal the blur never arrived and it looked fine; under LaunchServices, which is how
+  // `ccx systray` starts it, the app died at ~300ms every time.
   await closeAdopted(adopted, panel);
 
-  /* Redraw the menu bar dots, if what they would say has changed.
-   *
-   * The states in rank order are the whole of the icon, so comparing that list is exactly
+  /* The states in rank order are the whole of the icon, so comparing that list is exactly
    * the redraw test and a poll where nothing moved encodes no PNG. It has to be the ordered
-   * list and not the counts, since which dot is which color is what moves when a session
-   * changes state. The list is checked again after the encode, so two polls in flight
-   * cannot leave the older one's image on the bar.
+   * list and not the counts, since which dot is which color is what moves. The list is
+   * checked again after the encode, so two polls in flight cannot leave the older image up.
    */
   async function reicon(states) {
     const key = states.join(",");
@@ -775,8 +672,7 @@ export async function runSystray(argv = Deno.args) {
 
   await model.poll();
   setInterval(() => model.poll(), POLL);
-  // the only way to look at the panel from a script: clicking the icon needs a mouse and
-  // pressing the hotkey needs a person
+  // the only way to look at the panel from a script
   if (argv.includes("--show")) setTimeout(show, 600);   // after getBounds has settled
   return 0;
 }

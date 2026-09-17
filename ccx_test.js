@@ -1,20 +1,13 @@
-// The checked-in tests. `deno test -A --ext=js ccx_test.js`
-//
-// Nothing here touches live state: no discover(), no tmux, no ~/.claude. The library is
-// imported, the renderer is driven as a subprocess (`ccx` has no extension, and importing
-// it would run the CLI and Deno.exit out of the test process), and the icon and the bell
-// are pure.
-//
-// The numbers asserted are CLAUDE.md's. Where a section of CLAUDE.md is the source, it is
-// named above the test, so a doc edit and a test failure point at each other.
+// `deno test -A --ext=js ccx_test.js`. Nothing here touches live state: no discover(), no
+// tmux, no ~/.claude. The library is imported, the renderer is driven as a subprocess, and
+// the icon and the bell are pure.
 
-import {
-  fmtAge, fuzzy, Instance, loadBell, NUMBERS, PALETTE, paneState, rank, soundBytes, SORTS,
-  STATE, StateClock, summaryOf,
-} from "./claudes.js";
+import {fmtAge, Instance, paneState, StateClock, summaryOf} from "./claudes.js";
+import {fuzzy, NUMBERS, PALETTE, rank, SORTS, STATE} from "./view.js";
+import {loadBell, soundBytes} from "./bell.js";
 import {iconDots, iconPng} from "./icon.js";
 
-// ------------------------------------------------------------------------- assertions
+// assertions
 
 function ok(cond, what) {
   if (!cond) throw new Error(what);
@@ -31,25 +24,20 @@ function near(got, want, eps, what) {
   }
 }
 
-// ------------------------------------------------------------------------ the fixtures
+// the fixtures
 
-// rank() and render() are duck-typed: shortPath, summary, state, since, pid, age.
 let nextPid = 100;
 const row = (state, since, shortPath, summary = "", pid = nextPid++) =>
   ({state, since, shortPath, summary, pid});
 
-// East Asian Wide and Fullwidth, written out of Unicode's EastAsianWidth rather than
-// copied from the renderer, so a bug in its table is not also a bug in this one.
-// Ambiguous counts NARROW: the state glyphs are ambiguous and kitty draws them narrow.
-// The ranges, in order: 1100-115f, 2e80-303e, 3041-33ff, 3400-4dbf, 4e00-9fff, a000-a4cf,
-// ac00-d7a3, f900-faff, fe30-fe6f, ff01-ff60, ffe0-ffe6, and everything from 1f300 up.
+// written out of Unicode's EastAsianWidth, not copied from the renderer, so a bug in its
+// table is not also a bug here. Ambiguous counts NARROW, which is how kitty draws it
 const WIDE = /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹯！-｠￠-￦]/u;
 
 const width = (s) =>
   [...s].reduce((n, c) => n + (WIDE.test(c) || c.codePointAt(0) >= 0x1f300 ? 2 : 1), 0);
 
-// ------------------------------------------------------------------------------ fuzzy
-// CLAUDE.md `## The TUI` -> **fuzzy**
+// fuzzy
 
 Deno.test("fuzzy: a subsequence matches, and a missing character does not", () => {
   ok(fuzzy("wrng", "~/prj/wrangler"), "wrng should find ~/prj/wrangler");
@@ -63,8 +51,7 @@ Deno.test("fuzzy: wrng lands on the letters of wrangler", () => {
   const hay = "~/prj/wrangler";
   eq(fuzzy("wrng", hay).idx, [6, 7, 9, 10], "idx");
   eq([...fuzzy("wrng", hay).idx].map((i) => hay[i]).join(""), "wrng", "the matched text");
-  // 6 to reach the w, discounted to x1 because a `/` precedes it, then 1 skipped `a`
-  // inside a word at x2
+  // 6 to reach the w, x1 because a `/` precedes it, then 1 skipped `a` inside a word at x2
   eq(fuzzy("wrng", hay).score, 8, "score");
 });
 
@@ -75,7 +62,7 @@ Deno.test("fuzzy: cx collapses onto the TRAILING cx of ~/prj/ccx", () => {
 
 Deno.test("fuzzy: the hay is matched case-insensitively", () => {
   eq(fuzzy("cx", "~/PRJ/CCX").idx, [7, 8], "upper case hay");
-  // the needle is NOT lowered here; both UIs lower it before they call
+  // the needle is not lowered here: both UIs lower it before they call
   eq(fuzzy("CX", "~/prj/ccx"), null, "the caller owns lowering the needle");
 });
 
@@ -96,8 +83,7 @@ Deno.test("fuzzy: a prefix costs nothing", () => {
   eq(fuzzy("~/p", "~/prj/ccx"), {score: 0, idx: [0, 1, 2]}, "an exact prefix");
 });
 
-// ------------------------------------------------------------------------------- rank
-// CLAUDE.md `## States` and `## The TUI`
+// rank
 
 Deno.test("rank: state puts wait before busy before free", () => {
   const rows = [row("free", 0, "~/a"), row("busy", 0, "~/b"), row("wait", 0, "~/c")];
@@ -116,7 +102,7 @@ Deno.test("rank: path sorts by code point, not by locale", () => {
   const rows = [row("wait", 0, "~/apple"), row("wait", 0, "~/Banana")];
   eq(rank(rows, "", "path").map((i) => i.shortPath), ["~/Banana", "~/apple"],
     "B is 0x42 and a is 0x61");
-  // the two orders really do differ, so this is not asserting a coincidence
+  // the two orders really do differ, so this is not a coincidence
   ok("~/apple".localeCompare("~/Banana") < 0,
     "localeCompare would have put apple first; code point must not");
 });
@@ -166,8 +152,7 @@ Deno.test("SORTS is the two sorts the UIs cycle", () => {
   eq(NUMBERS, "1234567890", "the digits label the first ten rows in draw order");
 });
 
-// ------------------------------------------------------------------------- fmtAge etc
-// CLAUDE.md `## How the mapping works` -> the **`for`** column
+// fmtAge etc
 
 Deno.test("fmtAge: seconds, then minutes, then hours", () => {
   eq([0, 1, 59, 60, 61, 3599, 3600, 7199, 86400].map(fmtAge),
@@ -189,10 +174,9 @@ Deno.test("Instance: match is kitty's pid: form, or null with no kitty ancestor"
   eq(new Instance({}).match, null, "nothing to match on");
 });
 
-// -------------------------------------------------------------------- the palette rule
-// CLAUDE.md `### Columns and colors`: "Nothing is brighter than the gold"
+// the palette rule
 
-// WCAG relative luminance: linearize each sRGB channel, then 0.2126/0.7152/0.0722.
+// WCAG relative luminance: linearize each sRGB channel, then 0.2126/0.7152/0.0722
 function luminance(hex) {
   const n = Number.parseInt(hex.slice(1), 16);
   const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
@@ -226,13 +210,10 @@ Deno.test("colors: the state labels are 6 cells, which is the state column's wid
   }
 });
 
-// -------------------------------------------------------------------------- the frame
-// CLAUDE.md `### Columns and colors`
-//
-// `ccx` has no file extension, so it cannot be imported: --ext is for the entry point,
-// and the module runs the CLI and calls Deno.exit() on load. It is driven as a
-// subprocess instead, which is what `--snapshot` is for. Frames are cached, so each
-// (cols, rows, flags) combination costs one process however many tests read it.
+// the frame
+// `ccx` cannot be imported: --ext is for the entry point only, and the module runs the CLI
+// and calls Deno.exit() on load, so it is driven as a subprocess. Frames are cached, one
+// process per (cols, rows, flags) however many tests read it
 
 const CCX = new URL("./ccx", import.meta.url).pathname;
 const FRAMES = new Map();
@@ -253,8 +234,7 @@ async function snapshot(...args) {
   return FRAMES.get(key);
 }
 
-// One entry per display cell, so a two-cell character owns its cell and an empty one
-// after it. Column positions are cells, which String.length is not.
+// one entry per display cell: a two-cell character owns its cell and an empty one after it
 function cellsOf(line) {
   const out = [];
   for (const c of line) {
@@ -266,14 +246,12 @@ function cellsOf(line) {
 
 const at = (line, n, len = 1) => cellsOf(line).slice(n, n + len).join("");
 
-// 0-based display cells. The `1, 4, 12, 19, 47` CLAUDE.md names next to these are the
-// same positions inside the table body, before the one-cell left margin.
+// 0-based display cells, the table body's own positions plus the one-cell left margin
 const NUM = 2, STATE_COL = 5, FOR = 13, PATH = 20, SUMMARY = 48;
 const PATH_W = 26, SUMMARY_W = 50;
 
-// SAMPLE in `ccx`, after rank() with the default state sort: waits oldest-first, then
-// busys oldest-first, then free. Mirrored here on purpose, so changing the fixture
-// fails loudly instead of quietly weakening the test.
+// SAMPLE in `ccx` after rank(): waits oldest-first, then busys, then free. Mirrored here
+// on purpose, so changing the fixture fails loudly instead of weakening the test
 const ROWS = [
   ["● wait", "5m", "~/prj/kanji", "日本語のタイトル in a session title"],
   ["● wait", "42s", "~/prj/ccx", "port ccx from python to deno"],
@@ -316,9 +294,8 @@ Deno.test("snapshot: the japanese row's summary starts where the ascii rows' do"
   const frame = await snapshot("100x14", "plain");
   const kanji = frame[HEAD];
   eq(at(kanji, SUMMARY, 2), "日", "the summary column, counted in cells");
-  // 100 cells with eight two-cell characters in them is 92 code points. Counting UTF-16
-  // units instead of cells would have padded this line out to 100 code points, which is
-  // 108 cells, and the summary column of this one row would be out of line.
+  // 100 cells holding eight two-cell characters is 92 code points; counting UTF-16 units
+  // would pad to 100 code points, 108 cells, and throw this row's summary out of line
   eq([...kanji].length, 92, "code points in the japanese row");
   eq(width(kanji), 100, "display cells in the japanese row");
 });
@@ -392,14 +369,9 @@ Deno.test("snapshot: a filter reorders and the digits follow the drawn order", a
   eq(at(frame[HEAD + 1], NUM), "2", "the second row is numbered 2");
 });
 
-// --------------------------------------------------------------------------- the icon
-// CLAUDE.md `## The icon`
-//
-// This is the 951-case check that was thrown away, re-derived: every count 0 to 25 in
-// every mix of states. A "mix" here is every (wait, busy, free) split of the count, in
-// the order rank() hands them over, which is 3276 cases rather than 951; the original
-// number is not reconstructable from the doc, and this enumeration is a superset of any
-// reading of it.
+// the icon
+// every count 0 to 25 in every (wait, busy, free) split, in the order rank() hands them
+// over: 3276 cases
 
 const BOX = 18;                 // the icon is drawn into 18pt inside the menu bar's 22
 const EPS = 1e-9;
@@ -416,8 +388,7 @@ function* mixes(max = 25) {
   }
 }
 
-// The cell pitch, read off the dots rather than recomputed: the first two dots of any
-// grid are side by side, since the grid is never narrower than 2.
+// read off the dots, not recomputed: the first two of any grid are side by side
 const pitch = (spots) => (spots.length > 1 ? spots[1].cx - spots[0].cx : BOX / 2);
 
 Deno.test("icon: the grid is the smallest square that holds the dots, floor 2x2", () => {
@@ -515,9 +486,9 @@ Deno.test("icon: 3276 mixes, and the four numbers the doc records", () => {
   ok(maxLean < 9 * 0.62 / 2, "and it stays under half a free dot, 2.79pt");
 });
 
-// ------------------------------------------------------------------------ the icon png
+// the icon png
 
-// Only the filter-0, 8-bit RGBA form `png()` writes; enough to read the ink back.
+// only the filter-0, 8-bit RGBA form `png()` writes, enough to read the ink back
 async function decodePng(bytes) {
   eq([...bytes.slice(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10], "the PNG signature");
   const text = new TextDecoder();
@@ -583,8 +554,7 @@ Deno.test("iconPng: no instances draws a ring, with a hole in it", async () => {
   eq(pixel(18, 12).slice(0, 3), [0x8c, 0x8c, 0x8c], "drawn in the free grey");
 });
 
-// --------------------------------------------------------------------------- the bell
-// CLAUDE.md `## The bell`
+// the bell
 
 Deno.test("bell: BOTTLE unpacks to the WAV the python built, byte for byte", async () => {
   await loadBell();
@@ -621,11 +591,9 @@ Deno.test("bell: loadBell is idempotent and the bytes are stable", async () => {
   ok(soundBytes() === first, "the second call must not rebuild the buffer");
 });
 
-// --------------------------------------------------- the two version-coupled scrapers
-// CLAUDE.md `## How the mapping works` -> **state**, the fallback scrape
-//
-// These read a Claude Code screen and a Claude Code title, both undocumented and both
-// version-coupled. A rename would not be caught anywhere else.
+// the two version-coupled scrapers
+// a Claude Code screen and a Claude Code title, both undocumented and version-coupled:
+// a rename is not caught anywhere else
 
 const SPINNER_LINE = "✽ Working… (16m 29s · ↓ 54.6k tokens)";
 
@@ -681,19 +649,15 @@ Deno.test("summaryOf: the glyph comes off and the literal default becomes nothin
     "Claude Code review of the auth flow", "only the exact literal is dropped");
 });
 
-// ------------------------------------------------------- the cursor row, in full color
-// CLAUDE.md `### Columns and colors`: "The cursor row is a dark purple fill and every
-// cell keeps its own foreground under it, so the selected `wait` row is still yellow."
-//
-// This is the one part of the frame `plain` cannot show, since the fill is a background
-// and `plain` strips the SGR. `cursor=N` and `offset=N` are what make it reachable.
+// the cursor row, in full color
+// the one part of the frame `plain` cannot show, the fill being a background that `plain`
+// strips; `cursor=N` and `offset=N` are what make it reachable
 
 const ESCAPE = "\x1b";          // built, not a regex literal: deno lint's no-control-regex
 const SGR = new RegExp(`${ESCAPE}\\[([0-9;]*)m`, "g");
 
-// One {bg, fg, bold} per display cell. A run is a reset, then a background, then
-// optionally a foreground and a bold, then the text; so the state carries forward until
-// the next reset.
+// one {bg, fg, bold} per display cell: a run is a reset, a background, optionally a
+// foreground and a bold, then text, so state carries forward to the next reset
 function attrs(line) {
   const cells = [];
   let bg = "", fg = "", bold = false, at = 0;
@@ -801,12 +765,9 @@ Deno.test("cursor: the SGR constants above are PALETTE and STATE, not copied hex
   eq([rgb(PALETTE.text), rgb(PALETTE.idle)], [TEXT, IDLE], "the two summary colors");
 });
 
-// ----------------------------------------------------------------------- the bell rule
-// CLAUDE.md `## The bell` and `## States`
-//
-// StateClock.update() takes a plain list and shells out to nothing, so the rule that
-// decides when the bell rings is testable without a live discover(). Both UIs ring on
-// `clock.woke.length`, one sound per pass rather than one per instance.
+// the bell rule
+// StateClock.update() shells out to nothing, so the bell rule is testable without a live
+// discover(). Both UIs ring on `clock.woke.length`, one sound per pass, not per instance
 
 const inst = (pid, state, extra = {}) =>
   new Instance({pid, state, statusSince: 0, lastWrite: 0, ...extra});
@@ -898,8 +859,8 @@ Deno.test("StateClock: a pid that went away is first sight again when it returns
 });
 
 Deno.test("StateClock: a `since` of 0 means absent and must fall through", () => {
-  // the fallback chain is || and not ??, because 0 and "" are how these fields say
-  // "absent"; ?? only falls back on null, and would take a statusSince of 0 as 1970
+  // || and not ??: 0 and "" are how these fields say "absent", and ?? would take a
+  // statusSince of 0 as 1970
   const [seeded] = new StateClock().update([inst(1, "wait", {statusSince: 0, lastWrite: 555})]);
   eq(seeded.since, 555, "first sight: a zero statusSince falls through to lastWrite");
 
@@ -907,4 +868,174 @@ Deno.test("StateClock: a `since` of 0 means absent and must fall through", () =>
   clock.update([inst(2, "busy", {statusSince: 1000})]);
   const [moved] = clock.update([inst(2, "wait", {statusSince: 0})]);
   ok(moved.since > 1e9, `a transition with no record time takes now, not 0: got ${moved.since}`);
+});
+
+// the chat view
+
+// The frame goes through `--snapshot chat`, which draws CHAT_SAMPLE against a fixed `at`,
+// since an age off the clock is not reproducible. Mirrored here the way ROWS mirrors SAMPLE.
+const CHAT_HEAD = 2;            // bar, rule, then the conversation
+
+Deno.test("chat: every line is exactly as wide as the screen", async () => {
+  for (const box of ["100x22", "46x20", "60x8"]) {
+    const frame = await snapshot("chat", box, "plain");
+    const cols = Number(box.split("x")[0]);
+    frame.forEach((line, n) => eq(width(line), cols, `line ${n} of ${box}`));
+  }
+});
+
+Deno.test("chat: a header is the relative age, the sender and the recipient", async () => {
+  const frame = await snapshot("chat", "100x22", "plain");
+  eq(frame[CHAT_HEAD].trimEnd(), "   2h  ccx-ef → ccx-85", "age, from, to");
+});
+
+Deno.test("chat: the body wraps under its header rather than truncating", async () => {
+  const frame = await snapshot("chat", "100x22", "plain");
+  const body = frame.slice(CHAT_HEAD + 1, CHAT_HEAD + 4).map((l) => l.trimEnd());
+  ok(body[0].startsWith("       you own ccx"), `indented past the age: ${body[0]}`);
+  ok(body[2].endsWith("disk."), `the tail of a 190-character body is drawn: ${body[2]}`);
+  eq(frame[CHAT_HEAD + 4].trim(), "", "one blank line before the next message");
+});
+
+Deno.test("chat: a word longer than the line is cut, and nothing is lost", async () => {
+  const frame = await snapshot("chat", "46x40", "plain");
+  const joined = frame.map((l) => l.trimEnd().replace(/^ {7}/, "")).join("");
+  ok(joined.includes("/Users/fserb/prj/ccx/a-very-long-directory-name-that-does-not-fit-" +
+    "on-one-line-at-all/deeper"), "every character of the path survives the cut");
+});
+
+Deno.test("chat: a newline in a body starts a new line", async () => {
+  const frame = (await snapshot("chat", "100x22", "plain")).map((l) => l.trimEnd());
+  const n = frame.findIndex((l) => l.endsWith("chat.js is in."));
+  ok(n > 0, "the body stops where the newline was");
+  ok(frame[n + 1].includes("the log is"), `and the rest is under it: ${frame[n + 1]}`);
+});
+
+Deno.test("chat: offset scrolls by line, and the bar stays put", async () => {
+  const top = await snapshot("chat", "46x20", "plain");
+  const down = await snapshot("chat", "46x20", "plain", "offset=3");
+  eq(down[CHAT_HEAD], top[CHAT_HEAD + 3], "three lines of conversation went up");
+  eq(down[0], top[0], "the bar does not scroll");
+});
+
+Deno.test("chat: an empty conversation says so, and counts zero", async () => {
+  const frame = await snapshot("chat", "100x10", "plain", "empty");
+  ok(frame[CHAT_HEAD].includes("nothing has been said in here yet"), `note: ${frame[2]}`);
+  ok(frame[0].includes("0 msg"), `count: ${frame[0].trim()}`);
+});
+
+Deno.test("chat: the list's key hints name the key that opens it", async () => {
+  const frame = await snapshot("100x14", "plain");
+  ok(frame[0].includes("^t chat"), `the bar: ${frame[0].trim()}`);
+});
+
+// the target resolver, and the argument validation
+
+// Both drive the script as a subprocess, for the reason the frame does. Every case here is
+// decided before `ccx` looks at live state: `--resolve` runs against --snapshot's fixed
+// rows, and each bad argument list below exits on its own validation ahead of discover().
+// So this stays what the file header claims, and it sends no message to anybody.
+
+async function ccx(...args) {
+  const {code, stdout, stderr} = await new Deno.Command(Deno.execPath(), {
+    args: ["run", "-A", "--ext=js", CCX, ...args],
+  }).output();
+  const dec = new TextDecoder();
+  return {code, out: dec.decode(stdout).trimEnd(), err: dec.decode(stderr).trimEnd()};
+}
+
+async function resolved(...args) {
+  const {out} = await ccx("--resolve", ...args);
+  return out ? out.split("\n") : [];
+}
+
+Deno.test("resolve: a pid picks that instance and nothing else", async () => {
+  eq(await resolved("1002"), ["1002 blob2-7c ~/web/blob2"], "the pid is exact");
+});
+
+Deno.test("resolve: a name picks that instance and nothing else", async () => {
+  eq(await resolved("kanji-90"), ["1005 kanji-90 ~/prj/kanji"], "the name is exact");
+});
+
+Deno.test("resolve: a fuzzy target matching two is the feature, not an error", async () => {
+  eq(await resolved("ccx"), ["1000 ccx-e8 ~/prj/ccx", "1004 ccx-2f ~/prj/ccx:2"],
+    "both ccx sessions");
+});
+
+Deno.test("resolve: the fuzzy match reaches the name as well as the path", async () => {
+  eq(await resolved("wr3"), ["1001 wrangler-3a ~/prj/wrangler"],
+    "wr3 is in the name and not in the path");
+});
+
+Deno.test("resolve: all is every instance, and self= leaves us out of it", async () => {
+  eq((await resolved("all")).length, 7, "every row in the fixture");
+  const rest = await resolved("all", "self=1002");
+  eq(rest.length, 6, "one fewer");
+  ok(!rest.some((l) => l.startsWith("1002 ")), `and it is not us: ${rest.join(" | ")}`);
+});
+
+Deno.test("resolve: the same instance named twice is one target", async () => {
+  eq(await resolved("1005,kanji-90"), ["1005 kanji-90 ~/prj/kanji"],
+    "a pid and a name for one session send it one message");
+});
+
+Deno.test("resolve: targets keep the order they were written in", async () => {
+  eq(await resolved("1005,1000"),
+    ["1005 kanji-90 ~/prj/kanji", "1000 ccx-e8 ~/prj/ccx"], "not re-sorted");
+});
+
+Deno.test("resolve: a target matching nothing is a miss, and the rest still resolve",
+  async () => {
+    eq(await resolved("nope,1000"), ["miss nope", "1000 ccx-e8 ~/prj/ccx"], "one of each");
+  });
+
+const BAD = [
+  ["send"],                     // no target and nothing to say
+  ["send", "ccx-e8"],           // a target and nothing to say
+  ["send", "ccx-e8", "   "],    // whitespace is not a message
+  ["chat", "foo"],              // chat takes --no-follow, or nothing
+  ["--resolve"],                // no target
+  ["--snapshot", "bogus"],
+  ["focus"],                    // arity, which the command table checks
+  ["nonesuch"],
+];
+
+Deno.test("validation: every bad argument list is a usage line and exit 2", async () => {
+  for (const args of BAD) {
+    const r = await ccx(...args);
+    const what = `ccx ${args.join(" ")}`;
+    eq(r.code, 2, `${what} should exit 2`);
+    ok(r.err.startsWith("usage: ccx"), `${what}: stderr was ${JSON.stringify(r.err)}`);
+    eq(r.out, "", `${what} should print nothing on stdout`);
+  }
+});
+
+Deno.test("help: asking for it is stdout and 0, a bad argument list is stderr and 2",
+  async () => {
+    const asked = await ccx("help");
+    eq(asked.code, 0, "`ccx help` is not an error");
+    eq(asked.err, "", "and says nothing on stderr");
+    ok(asked.out.startsWith("usage: ccx"), `stdout was ${JSON.stringify(asked.out)}`);
+    // one text, two streams: every command the table dispatches is named in it
+    for (const name of ["list", "doctor", "focus", "send", "chat", "systray", "help"]) {
+      ok(new RegExp(`^  ${name}\\b`, "m").test(asked.out), `${name} is not in the help`);
+    }
+    eq((await ccx("nonesuch")).err, asked.out, "and a bad command prints the same text");
+  });
+
+Deno.test("validation: a bad argument list is never a traceback", async () => {
+  for (const args of BAD) {
+    const {err} = await ccx(...args);
+    ok(!/^\s+at /m.test(err), `ccx ${args.join(" ")} leaked a stack:\n${err}`);
+    ok(!/\bError\b/.test(err), `ccx ${args.join(" ")} leaked an exception:\n${err}`);
+  }
+});
+
+Deno.test("validation: send with no message never reaches resolution", async () => {
+  // the order matters: a target is resolved against live state, so a message that is not
+  // there has to be caught first or `ccx send ccx-ef` would go looking for ccx-ef
+  const {code, err, out} = await ccx("send", "ccx-e8");
+  eq(code, 2, "exit 2");
+  eq(out, "", "and nothing was resolved, listed or sent");
+  ok(err.startsWith("usage: ccx"), `usage: ${err.split("\n")[0]}`);
 });
