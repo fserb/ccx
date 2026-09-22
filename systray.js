@@ -128,6 +128,10 @@ function objc() {
       flag: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "bool"},
       setFlag: {name: "objc_msgSend",
         parameters: ["pointer", "pointer", "bool"], result: "void"},
+      with: {name: "objc_msgSend",
+        parameters: ["pointer", "pointer", "pointer"], result: "pointer"},
+      setArg: {name: "objc_msgSend",
+        parameters: ["pointer", "pointer", "buffer", "i64"], result: "void"},
       perform: {name: "objc_msgSend",
         parameters: ["pointer", "pointer", "pointer", "pointer", "bool"], result: "void"},
     }).symbols;
@@ -171,6 +175,47 @@ function statusButton() {
     if (found) return found;
   }
   return null;
+}
+
+/* Put the panel on every Space. It is parked off screen and never hidden, so without this
+ * it stays on the Space it was first shown on, and `setPosition` opens it there, on a desktop
+ * you are not looking at. CanJoinAllSpaces is 1 << 0, FullScreenAuxiliary 1 << 8, which is
+ * what lets it over a full-screen app. The panel is the only `LaufeyKeyableWindow`.
+ *
+ * `setCollectionBehavior:` called off the main thread is a SIGTRAP in AppKit's
+ * NSWMWindowCoordinator, not a silent no-op, and it takes a word, not an object, so
+ * `performSelectorOnMainThread:` cannot carry it. An NSInvocation can: it holds the target,
+ * selector and word, and `invoke` is a selector with no argument.
+ */
+function joinAllSpaces() {
+  try {
+    const s = objc();
+    const sel = (n) => s.sel_registerName(CSTR.encode(`${n}\0`));
+    const cls = (n) => s.objc_getClass(CSTR.encode(`${n}\0`));
+    const named = (o) => new Deno.UnsafePointerView(
+      s.msg(s.msg(o, sel("className")), sel("UTF8String"))).getCString();
+    const app = s.msg(cls("NSApplication"), sel("sharedApplication"));
+    const windows = s.msg(app, sel("windows"));
+    const n = Number(s.count(windows, sel("count")));
+    for (let k = 0; k < n; k++) {
+      const w = s.at(windows, sel("objectAtIndex:"), BigInt(k));
+      if (!named(w).includes("KeyableWindow")) continue;
+      const set = sel("setCollectionBehavior:");
+      const sig = s.with(w, sel("methodSignatureForSelector:"), set);
+      // an autoreleased object with no pool to drain it: retained so it outlives the hop
+      const inv = s.msg(s.with(cls("NSInvocation"), sel("invocationWithMethodSignature:"), sig),
+        sel("retain"));
+      s.with(inv, sel("setTarget:"), w);
+      s.with(inv, sel("setSelector:"), set);
+      const word = new BigUint64Array([(1n << 0n) | (1n << 8n)]);
+      s.setArg(inv, sel("setArgument:atIndex:"), new Uint8Array(word.buffer), 2n);
+      s.msg(inv, sel("retainArguments"));
+      s.perform(inv, sel("performSelectorOnMainThread:withObject:waitUntilDone:"),
+        sel("invoke"), null, false);
+    }
+  } catch {
+    // a panel on one Space is worth more than a menu bar app that died moving it
+  }
 }
 
 // Retries while the item is unplaced or Deno's block has not run. `stale` says a newer icon
@@ -653,6 +698,7 @@ export async function runSystray(argv = Deno.args) {
   // a terminal the blur never arrived and it looked fine; under LaunchServices, which is how
   // `ccx systray` starts it, the app died at ~300ms every time.
   await closeAdopted(adopted, panel);
+  if (MAC) joinAllSpaces();   // the panel is visible now, so its NSWindow exists
 
   /* The states in rank order and the slash are the whole of the icon, so comparing that
    * list is exactly the redraw test and a poll where nothing moved encodes no PNG. It has to be the ordered
