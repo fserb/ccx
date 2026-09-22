@@ -11,6 +11,7 @@ import {fuzzy, NUMBERS, PALETTE, rank, stateOf} from "./view.js";
 import {jump} from "./jump.js";
 import {loadBell, play} from "./bell.js";
 import {iconPng} from "./icon.js";
+import {Online} from "./online.js";
 
 const POLL = 1500;          // same cadence as the TUI, so the bell lands as promptly
 
@@ -199,6 +200,7 @@ function recolor(stale, tries = 0) {
 class Model {
   constructor(redraw, close, quit) {
     this.clock = new StateClock();
+    this.net = new Online();
     this.polling = false;
     this.instances = [];
     this.rows = [];
@@ -212,9 +214,10 @@ class Model {
 
   // discover() is async, so the interval does not wait for the poll it started; the guard
   // drops the next tick rather than letting two land out of order and paint the older
-  // listing. This is the thing that runs all day, so it also owns the bell.
+  // listing. This is the thing that runs all day, so it also owns the bell and the probe.
   async poll() {
-    if (this.polling) return;
+    this.net.tick();           // returns at once; a probe is due every 30s, or 5s once one
+    if (this.polling) return;  // has failed, and never blocks the listing
     this.polling = true;
     try {
       this.instances = this.clock.update(await discover());
@@ -263,6 +266,13 @@ class Model {
     };
   }
 
+  // Beside the counter, not in the note line, which the "+N more" hint needs while you
+  // type.
+  offline() {
+    if (!this.net.offline) return null;
+    return {text: `${this.net.label}  ·  `, color: PALETTE.error};
+  }
+
   empty() {
     return this.instances.length ? "nothing matches" : "no claude instances";
   }
@@ -285,6 +295,7 @@ class Model {
     return {
       filter: this.filter,
       counter: this.counter(),
+      offline: this.offline(),
       empty: this.rows.length ? "" : this.empty(),
       note: this.note(),
       hints: HINTS,
@@ -432,8 +443,12 @@ function field(cls, string, color, hits) {
 function ccx(state) {
   $("filter").textContent = state.filter ? "/" + state.filter : "type to filter";
   $("filter").style.color = state.filter ? "${PALETTE.accent}" : "${PALETTE.hint}";
-  $("count").textContent = state.counter.text;
-  $("count").style.color = state.counter.color;
+  // two runs in one right-aligned box, so the offline mark grows leftwards off the counter
+  $("count").textContent = "";
+  if (state.offline) {
+    $("count").appendChild(field("off", state.offline.text, state.offline.color, null));
+  }
+  $("count").appendChild(field("cnt", state.counter.text, state.counter.color, null));
   $("note").textContent = state.note.text;
   $("note").style.color = state.note.color;
   $("hints").textContent = state.hints;
@@ -639,23 +654,23 @@ export async function runSystray(argv = Deno.args) {
   // `ccx systray` starts it, the app died at ~300ms every time.
   await closeAdopted(adopted, panel);
 
-  /* The states in rank order are the whole of the icon, so comparing that list is exactly
-   * the redraw test and a poll where nothing moved encodes no PNG. It has to be the ordered
+  /* The states in rank order and the slash are the whole of the icon, so comparing that
+   * list is exactly the redraw test and a poll where nothing moved encodes no PNG. It has to be the ordered
    * list and not the counts, since which dot is which color is what moves. The list is
    * checked again after the encode, so two polls in flight cannot leave the older image up.
    */
-  async function reicon(states) {
-    const key = states.join(",");
+  async function reicon(states, offline) {
+    const key = `${offline ? "/" : ""}${states.join(",")}`;
     if (key === drawn) return;
     drawn = key;
-    const png = await iconPng(states);
+    const png = await iconPng(states, 2, offline);
     if (key !== drawn) return;
     tray.setIcon(png);
     recolor(() => key !== drawn);   // it arrives marked as a template; see above
   }
 
   function redraw() {
-    reicon(model.states());
+    reicon(model.states(), model.net.offline);
     const height = model.height();
     if (height !== sized) {
       sized = height;

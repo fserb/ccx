@@ -11,6 +11,7 @@ import {HOME, ON_EXIT, sh} from "./sh.js";
 import {fuzzy, NUMBERS, PALETTE, rank, SORTS, stateOf} from "./view.js";
 import {jump, kittyWindowTitle, raiseTarget, tmuxWindowName} from "./jump.js";
 import {loadBell, play, ringer, soundBytes} from "./bell.js";
+import {Online} from "./online.js";
 
 // `peer.js` and `chat.js` load on use, not at startup: a missing one must cost `ccx send`
 // its error line and nothing else. A static import would take `list`, `doctor` and the TUI
@@ -178,7 +179,9 @@ function barLine(view, cols) {
     ? `${view.ranked.length} of ${view.total}`
     : `${view.waiting}/${view.total}`;
   const loud = view.waiting > 0 && !view.filter;
-  const status = [{t: count, c: loud ? PALETTE.gold : PALETTE.mauve, b: loud},
+  const off = view.offline
+    ? [{t: `${view.offline}  ·  `, c: PALETTE.error, b: true}] : [];
+  const status = [...off, {t: count, c: loud ? PALETTE.gold : PALETTE.mauve, b: loud},
     {t: `  ·  by ${view.sort}`, c: PALETTE.mauve}];
   // hints go first on a narrow screen: the counts are the only place waiting is written
   const room = cols - span(status) - 4;
@@ -339,6 +342,7 @@ const SHORT_CWD = CWD.replace(HOME, "~");
 
 const app = {
   clock: new StateClock(),
+  net: new Online(),
   instances: [],
   ranked: [],
   filter: "",
@@ -376,6 +380,7 @@ function view() {
     filter: app.filter,
     needle: needle(),
     sort: app.sort,
+    offline: app.net.offline ? app.net.label : "",
     cursor: app.cursor,
     offset: app.offset,
     toast: app.toast,
@@ -388,7 +393,8 @@ function view() {
 // discover would stack up and race a stale listing onto the screen; skipping drops the tick
 let polling = false;
 async function reload() {
-  if (polling) return;
+  app.net.tick();              // returns at once; the probe is its own 30s clock, or 5s
+  if (polling) return;         // once one has failed, and never blocks the listing
   polling = true;
   try {
     app.instances = app.clock.update(await discover());
@@ -712,7 +718,7 @@ const CHAT_SAMPLE = [
 // and an `at` fixed against NOW, since a relative age off the clock is not reproducible
 function cmdSnapshot(...args) {
   let cols = 100, height = 14, plain = false, filter = "", rows = sample(), toast = null;
-  let cursor = 0, offset = 0, chat = false;
+  let cursor = 0, offset = 0, chat = false, offline = "";
   for (const a of args) {
     const wh = /^(\d+)x(\d+)$/.exec(a);
     const nm = /^(cursor|offset)=(\d+)$/.exec(a);
@@ -721,6 +727,7 @@ function cmdSnapshot(...args) {
     else if (a === "plain") plain = true;
     else if (a === "chat") chat = true;
     else if (a === "empty") rows = [];
+    else if (a === "offline") offline = "offline";
     else if (a === "toast") toast = "pid 1000 is not inside tmux; nothing to focus";
     else if (a.startsWith("/")) filter = a.slice(1);
     else return usage();
@@ -732,7 +739,7 @@ function cmdSnapshot(...args) {
       cols, height, now: NOW})
     : render({
       ranked, total: rows.length, waiting: rows.filter((i) => i.state === "wait").length,
-      filter, needle, sort: SORTS[0], cursor, offset, toast, cols, height,
+      filter, needle, sort: SORTS[0], offline, cursor, offset, toast, cols, height,
     })).join("\n");
   console.log(plain ? frame.replaceAll(SGR, "") : frame);
 }
@@ -772,6 +779,12 @@ async function cmdDoctor() {
   // the two per-platform pieces: a box that jumps but stays silent says which
   console.log(`platform ${Deno.build.os}  bell ${ringer()}  ` +
     `sound ${soundBytes().length}B of wav, straight from memory`);
+  // one probe, awaited: doctor is the place to see the endpoint and what it answered, and
+  // `from` is the only way to tell which file or var set it
+  const net = new Online();
+  const probe = await net.probe();
+  console.log(`api ${net.url} (${net.from}) ${probe.ok ? "up" : "DOWN"} ` +
+    `${probe.note} in ${Math.round(probe.ms)}ms`);
   const records = sessionRecords();
   for (const i of await discover()) {
     const rec = records[i.pid] ?? {};

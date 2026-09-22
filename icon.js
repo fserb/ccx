@@ -15,6 +15,19 @@ const FREE = [0x8c, 0x8c, 0x8c];
 const SS = 8;               // samples per pixel edge, so 64 levels of coverage on a rim
 const RING = 1.2;           // pt, the stroke for the no-instances ring
 
+// The API is not answering: a slash over whatever the dots say. White is the one thing in
+// the icon above the gold by luminance, which the dots are ordered by; it is not a state,
+// it is drawn over all of them, and it has to read against every one. ON A LIGHT MENU BAR
+// IT DOES NOT: the line and the gap either side of it are both lighter than the dots, so on
+// a light desktop the slash shows only as a break in them.
+//
+// The line is cleared before it is drawn, so it separates from a dot rather than merging
+// with it; GAP is how wide that clearing is on each side.
+const SLASH = [0xff, 0xff, 0xff];
+const SLASH_W = 2.0;        // pt, the stroke: at 2.4, with a 1.1 gap, the two off-diagonal
+const SLASH_GAP = 0.6;      // dots of a three-dot icon are left as crescents
+const SLASH_PAD = 2.2;      // pt from the corners it runs between
+
 // Where a dot per state goes in a `box`-sized square, as {cx, cy, r}, cy from the top. What
 // is centered is the BLOCK OF CELLS THE DOTS USE, not the whole grid and not each row on
 // its own: centering rows individually reads as a triangle, not a grid with a hole.
@@ -42,7 +55,6 @@ export function iconDots(states, box = ICON) {
 // at these sizes the difference is under a level of alpha. Only the dot's bounding box is
 // walked, so the cost is the ink and not the canvas.
 function stamp(rgba, px, cx, cy, outer, inner, color) {
-  const [r, g, b] = color;
   const o2 = outer * outer, i2 = inner * inner;
   const x0 = Math.max(0, Math.floor(cx - outer)), x1 = Math.min(px, Math.ceil(cx + outer) + 1);
   const y0 = Math.max(0, Math.floor(cy - outer)), y1 = Math.min(px, Math.ceil(cy + outer) + 1);
@@ -56,22 +68,64 @@ function stamp(rgba, px, cx, cy, outer, inner, color) {
           if (d2 <= o2 && d2 >= i2) hit++;
         }
       }
-      if (!hit) continue;
-      // straight alpha, not premultiplied, which is what a PNG carries: a future overlap
-      // is then a dimmer dot rather than a hole punched in the one underneath
-      const a = hit / (SS * SS), at = (y * px + x) * 4;
-      const keep = (rgba[at + 3] / 255) * (1 - a);
-      const out = a + keep;
-      rgba[at] = Math.round((r * a + rgba[at] * keep) / out);
-      rgba[at + 1] = Math.round((g * a + rgba[at + 1] * keep) / out);
-      rgba[at + 2] = Math.round((b * a + rgba[at + 2] * keep) / out);
-      rgba[at + 3] = Math.round(out * 255);
+      if (hit) mix(rgba, (y * px + x) * 4, hit / (SS * SS), color);
     }
   }
 }
 
-// The menu bar image for `states`, as PNG bytes at `scale` pixels per point.
-export function iconPng(states, scale = 2) {
+// One pixel, `a` covered by `color`, or erased where `color` is null. Straight alpha, not
+// premultiplied, which is what a PNG carries: an overlap is then a dimmer dot rather than a
+// hole punched in the one underneath, and the hole is asked for explicitly.
+function mix(rgba, at, a, color) {
+  if (!color) {
+    rgba[at + 3] = Math.round(rgba[at + 3] * (1 - a));
+    return;
+  }
+  const [r, g, b] = color;
+  const keep = (rgba[at + 3] / 255) * (1 - a);
+  const out = a + keep;
+  rgba[at] = Math.round((r * a + rgba[at] * keep) / out);
+  rgba[at + 1] = Math.round((g * a + rgba[at + 1] * keep) / out);
+  rgba[at + 2] = Math.round((b * a + rgba[at + 2] * keep) / out);
+  rgba[at + 3] = Math.round(out * 255);
+}
+
+// The segment a..b as a `w`-wide stroke with round caps, or the hole one would leave where
+// `color` is null. Coverage is sampled like stamp()'s, against the distance to the segment.
+function stampSeg(rgba, px, a, b, w, color) {
+  const r = w / 2, r2 = r * r;
+  const vx = b.x - a.x, vy = b.y - a.y, vv = vx * vx + vy * vy;
+  const x0 = Math.max(0, Math.floor(Math.min(a.x, b.x) - r));
+  const x1 = Math.min(px, Math.ceil(Math.max(a.x, b.x) + r) + 1);
+  const y0 = Math.max(0, Math.floor(Math.min(a.y, b.y) - r));
+  const y1 = Math.min(px, Math.ceil(Math.max(a.y, b.y) + r) + 1);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      let hit = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        for (let sx = 0; sx < SS; sx++) {
+          const dx = x + (sx + 0.5) / SS - a.x, dy = y + (sy + 0.5) / SS - a.y;
+          const t = Math.max(0, Math.min(1, (dx * vx + dy * vy) / vv));
+          const ex = dx - t * vx, ey = dy - t * vy;
+          if (ex * ex + ey * ey <= r2) hit++;
+        }
+      }
+      if (hit) mix(rgba, (y * px + x) * 4, hit / (SS * SS), color);
+    }
+  }
+}
+
+// Corner to corner, bottom left to top right, over everything already drawn.
+function slash(rgba, px, scale) {
+  const a = {x: SLASH_PAD * scale, y: px - SLASH_PAD * scale};
+  const b = {x: px - SLASH_PAD * scale, y: SLASH_PAD * scale};
+  stampSeg(rgba, px, a, b, (SLASH_W + 2 * SLASH_GAP) * scale, null);
+  stampSeg(rgba, px, a, b, SLASH_W * scale, SLASH);
+}
+
+// The menu bar image for `states`, as PNG bytes at `scale` pixels per point. `offline` is
+// the API not answering, which is a slash across the whole icon and not a state a dot has.
+export function iconPng(states, scale = 2, offline = false) {
   const px = Math.round(ICON * scale);
   const rgba = new Uint8Array(px * px * 4);
   const spots = iconDots(states, px);
@@ -84,6 +138,7 @@ export function iconPng(states, scale = 2) {
     const w = Math.max(1, RING * scale);
     stamp(rgba, px, cx, cy, r + w / 2, r - w / 2, FREE);
   }
+  if (offline) slash(rgba, px, scale);
   return png(px, px, rgba);
 }
 

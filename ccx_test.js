@@ -6,6 +6,7 @@ import {fmtAge, Instance, paneState, StateClock, summaryOf} from "./claudes.js";
 import {fuzzy, NUMBERS, PALETTE, rank, SORTS, STATE} from "./view.js";
 import {loadBell, soundBytes} from "./bell.js";
 import {iconDots, iconPng} from "./icon.js";
+import {baseFromSettings, Online, pickBase} from "./online.js";
 
 // assertions
 
@@ -536,12 +537,15 @@ Deno.test("iconPng: a 36px 2x image, and the dots are the sizes and colors claim
     ok(wait.ink > free.ink * 1.5, "gold is bigger as well as brighter");
   });
 
-Deno.test("iconPng: the icon's colors keep the gold brightest", () => {
+Deno.test("iconPng: the dots keep the gold brightest, and only the slash is above it", () => {
   near(luminance("#ffd500"), 0.69, 0.005, "wait, the panel's gold");
   near(luminance("#c8c8c8"), 0.58, 0.005, "busy, brighter here than in the table");
   near(luminance("#8c8c8c"), 0.26, 0.005, "free, flat rather than translucent");
   ok(luminance("#c8c8c8") < luminance("#ffd500"), "busy under the gold");
   ok(luminance("#8c8c8c") < luminance("#c8c8c8"), "free under busy");
+  // the one exception, and deliberate: the slash is not a state, it is drawn across every
+  // dot colour at once, and it has to read against all of them
+  ok(luminance("#ffffff") > luminance("#ffd500"), "the offline slash is above the gold");
 });
 
 Deno.test("iconPng: no instances draws a ring, with a hole in it", async () => {
@@ -553,6 +557,138 @@ Deno.test("iconPng: no instances draws a ring, with a hole in it", async () => {
   near(ink, area, area * 0.02, "the ring's area");
   eq(pixel(18, 12).slice(0, 3), [0x8c, 0x8c, 0x8c], "drawn in the free grey");
 });
+
+Deno.test("iconPng: offline slashes the icon, and cuts a gap either side of the line",
+  async () => {
+    const on = await decodePng(await iconPng(["wait"], 2, true));
+    const off = await decodePng(await iconPng(["wait"], 2, false));
+    // the line runs corner to corner through the middle, where the one dot is
+    eq(on.pixel(18, 18), [0xff, 0xff, 0xff, 255], "the slash over the dot, white and opaque");
+    eq(on.pixel(17, 17), [0xff, 0xff, 0xff, 255], "and the pixel beside it, so it is a line");
+    eq(off.pixel(18, 18), [0xff, 0xd5, 0x00, 255], "the same pixel is the gold without it");
+    eq(on.pixel(4, 31), [0xff, 0xff, 0xff, 255], "the bottom left end, 2.2pt in");
+    eq(on.pixel(31, 4), [0xff, 0xff, 0xff, 255], "the top right end");
+    eq(off.pixel(4, 31)[3], 0, "nothing is drawn out there otherwise");
+    // At 45 degrees a pixel is 1.41 cells across the line, wider than the 0.6pt gap, so no
+    // pixel in it is fully cleared; what the gap has to do is thin the dot under the line.
+    for (const [x, y] of [[19, 19], [16, 16]]) {
+      ok(on.pixel(x, y)[3] < 128, `(${x},${y}) is the gap: ${on.pixel(x, y)[3]} of 255`);
+      eq(off.pixel(x, y)[3], 255, `(${x},${y}) is solid gold with no slash`);
+    }
+    // two pixels out and the dot is whole again: a wider slash eats the dots it crosses
+    // instead of crossing them, which is what 2.4pt with a 1.1pt gap did
+    for (const [x, y] of [[21, 21], [14, 14]]) {
+      eq(on.pixel(x, y), [0xff, 0xd5, 0x00, 255], `(${x},${y}) is still the dot`);
+    }
+    ok(on.ink > off.ink, "the slash adds more ink than its gap takes away");
+  });
+
+Deno.test("iconPng: the slash is off unless it is asked for", async () => {
+  const bare = await iconPng(["wait", "busy"]);
+  const said = await iconPng(["wait", "busy"], 2, false);
+  eq([...bare], [...said], "the default is the same image as offline: false");
+});
+
+// online
+
+Deno.test("online: the first source that holds a URL wins, and the default is Anthropic", () => {
+  eq(pickBase("", "", ""), {url: "https://api.anthropic.com", from: "default"},
+    "nothing set anywhere");
+  eq(pickBase("", "", "http://env").from, "$ANTHROPIC_BASE_URL", "the environment");
+  eq(pickBase("", "http://user", "http://env").from, "~/.claude/settings.json",
+    "a user setting outranks the environment");
+  eq(pickBase("http://managed", "http://user", "http://env").url, "http://managed",
+    "a managed policy outranks both");
+});
+
+Deno.test("online: a trailing slash is dropped, or the probe asks for //v1/models", () => {
+  eq(pickBase("", "", "http://proxy:4000/").url, "http://proxy:4000", "one slash");
+  eq(pickBase("", "", "http://proxy:4000///").url, "http://proxy:4000", "three");
+});
+
+Deno.test("online: the URL is read out of a settings file's env block", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const path = `${dir}/settings.json`;
+    await Deno.writeTextFile(path, JSON.stringify({env: {ANTHROPIC_BASE_URL: " http://x "}}));
+    eq(baseFromSettings(path), "http://x", "trimmed");
+    await Deno.writeTextFile(path, JSON.stringify({env: {}}));
+    eq(baseFromSettings(path), "", "an empty env block");
+    await Deno.writeTextFile(path, '{"env": {"ANTHROPIC_BASE_URL"');
+    eq(baseFromSettings(path), "", "a file caught half-written reads as unset");
+    eq(baseFromSettings(`${dir}/nope.json`), "", "a missing file too");
+  } finally {
+    await Deno.remove(dir, {recursive: true});
+  }
+});
+
+Deno.test("online: the host is named only when it is not the default", () => {
+  eq(new Online(pickBase("", "", "")).label, "offline", "nothing to disambiguate");
+  eq(new Online(pickBase("", "", "http://127.0.0.1:4000")).label, "offline 127.0.0.1:4000",
+    "an override is worth the cells it costs");
+});
+
+// a local server, so nothing here needs the network to pass
+async function served(status, fn) {
+  const server = Deno.serve({port: 0, hostname: "127.0.0.1", onListen: () => {}},
+    () => new Response("{}", {status}));
+  const {port} = /** @type {any} */ (server.addr);
+  try {
+    return await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    await server.shutdown();
+  }
+}
+
+Deno.test("online: an answer is up, a 5xx is down, and nothing listening is down", async () => {
+  for (const status of [200, 401, 404]) {
+    const r = await served(status, (url) => new Online({url, from: "test"}).probe());
+    eq([r.ok, r.note], [true, `HTTP ${status}`], `${status} is the server answering`);
+  }
+  for (const status of [500, 503]) {
+    const r = await served(status, (url) => new Online({url, from: "test"}).probe());
+    eq([r.ok, r.note], [false, `HTTP ${status}`], `${status} is not`);
+  }
+  // a port that was listening and is not any more, so this is a refusal and not a timeout
+  const dead = await served(200, (url) => url);
+  const r = await new Online({url: dead, from: "test"}).probe();
+  eq(r.ok, false, "nothing listening");
+  ok(r.note.startsWith("TypeError"), `a thrown fetch is reported: ${r.note}`);
+});
+
+Deno.test("online: two failures draw the slash, one success clears it", () => {
+  const net = new Online({url: "http://x", from: "test"});
+  ok(!net.offline, "a fresh one is not offline, so a start never flashes the slash");
+  net.record(false);
+  ok(!net.offline, "one failure is a dropped request, not an outage");
+  net.record(false);
+  ok(net.offline, "two consecutive failures");
+  net.record(false);
+  eq(net.fails, 2, "the count is capped, so a long outage still clears on one success");
+  net.record(true);
+  ok(!net.offline, "and it does");
+});
+
+Deno.test("online: a probe is due every 30s, or every 5s once one has failed", () => {
+  const net = new Online({url: "http://x", from: "test"});
+  ok(net.due(0), "never probed, so the first tick probes");
+  net.last = 1000;
+  ok(!net.due(1000 + 29_000), "29s after the last one");
+  ok(net.due(1000 + 30_000), "30s after it");
+  net.record(false);
+  ok(!net.due(1000 + 4_000), "4s, having failed");
+  ok(net.due(1000 + 5_000), "5s, having failed");
+  net.busy = true;
+  ok(!net.due(1000 + 60_000), "a probe still in flight is never overtaken");
+});
+
+Deno.test("snapshot: offline is written beside the counter, and keeps the key hints",
+  async () => {
+    const bar = (await snapshot("100x8", "plain", "offline"))[0];
+    ok(bar.includes("offline  ·  3/7  ·  by state"), `the bar reads: ${bar.trim()}`);
+    ok(bar.includes("^t chat"), "and 100 cells still has room for the keys");
+    ok(!(await snapshot("100x8", "plain"))[0].includes("offline"), "nothing when it is up");
+  });
 
 // the bell
 
