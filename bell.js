@@ -12,8 +12,7 @@ const PLAYERS = MAC ? [] : [
 ];
 let PLAYER = null;             // resolved on the first ring, then reused
 let BELL = null;               // BOTTLE unpacked, by loadBell()
-let RINGER = null;             // the AVAudioPlayer holding it, on the first ring; macOS only
-let OBJC = null;               // the libobjc handle and its selectors, once loaded
+let RINGER = null;             // plays the system sound, set up on the first ring; macOS only
 
 function bellCmd() {
   if (PLAYER === null) {
@@ -24,7 +23,7 @@ function bellCmd() {
 
 // What will make the sound, for doctor.
 export function ringer() {
-  return MAC ? "AVAudioPlayer" : bellCmd().join(" ") || "(no player)";
+  return MAC ? "AudioServicesPlaySystemSound" : bellCmd().join(" ") || "(no player)";
 }
 
 // BOTTLE unpacked into the bytes of a WAV file. Async because Deno has no lzma and its
@@ -75,40 +74,40 @@ export function soundBytes() {
 
 const cstr = (s) => BYTES.encode(`${s}\0`);
 
-// Play wav through AVAudioPlayer, which takes bytes and wants no file: no macOS player
-// reads stdin. THE STOP IS NOT OPTIONAL. Once the sound has run out, play on its own
-// returns YES and does nothing. objc_msgSend needs one alias per signature.
+/* Play wav as a system sound, which `systemsoundserverd` plays, not us.
+ *
+ * NOT AVAudioPlayer: that starts CoreAudio inside this process, and in the built app it
+ * then sets up voice processing for the bundle id and asks TCC for the MICROPHONE, a real
+ * prompt, on the first ring. An ad-hoc signature is a new identity on every build, so every
+ * rebuild asked again. With a system sound no CoreAudio loads here and TCC is never asked.
+ * The cost: it goes to the alert device at the alert volume, and it wants a file, which is
+ * written once to a fixed path, not one per process.
+ */
 function ring(sound) {
-  if (!OBJC) {
-    const lib = Deno.dlopen("/usr/lib/libobjc.A.dylib", {
-      objc_getClass: {parameters: ["buffer"], result: "pointer"},
-      sel_registerName: {parameters: ["buffer"], result: "pointer"},
-      msg: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "pointer"},
-      msgBool: {name: "objc_msgSend", parameters: ["pointer", "pointer"], result: "bool"},
-      msgBytes: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "buffer", "usize"], result: "pointer"},
-      msgTwo: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "pointer", "pointer"], result: "pointer"},
-      msgDouble: {name: "objc_msgSend",
-        parameters: ["pointer", "pointer", "f64"], result: "void"},
-    });
-    Deno.dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", {});
-    OBJC = lib.symbols;
-  }
-  const s = OBJC;
-  const cls = (n) => s.objc_getClass(cstr(n));
-  const sel = (n) => s.sel_registerName(cstr(n));
   if (!RINGER) {
-    const data = s.msgBytes(s.msg(cls("NSData"), sel("alloc")),
-      sel("initWithBytes:length:"), sound, BigInt(sound.length));
-    RINGER = s.msgTwo(s.msg(cls("AVAudioPlayer"), sel("alloc")),
-      sel("initWithData:error:"), data, null);
-    if (!RINGER) return;
-    s.msgBool(RINGER, sel("prepareToPlay"));
+    const path = `${Deno.env.get("TMPDIR") ?? "/tmp/"}ccx-bell.wav`;
+    let size = -1;
+    try {
+      size = Deno.statSync(path).size;
+    } catch {
+      // not there yet
+    }
+    if (size !== sound.length) Deno.writeFileSync(path, sound);
+    const cf = Deno.dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", {
+      CFURLCreateFromFileSystemRepresentation: {
+        parameters: ["pointer", "buffer", "isize", "bool"], result: "pointer"},
+    }).symbols;
+    const at = Deno.dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", {
+      AudioServicesCreateSystemSoundID: {parameters: ["pointer", "buffer"], result: "i32"},
+      AudioServicesPlaySystemSound: {parameters: ["u32"], result: "void"},
+    }).symbols;
+    const bytes = BYTES.encode(path);
+    const url = cf.CFURLCreateFromFileSystemRepresentation(null, bytes, BigInt(bytes.length), false);
+    const id = new Uint32Array(1);
+    if (at.AudioServicesCreateSystemSoundID(url, new Uint8Array(id.buffer)) !== 0) return;
+    RINGER = () => at.AudioServicesPlaySystemSound(id[0]);
   }
-  s.msgBool(RINGER, sel("stop"));
-  s.msgDouble(RINGER, sel("setCurrentTime:"), 0);
-  s.msgBool(RINGER, sel("play"));
+  RINGER();
 }
 
 // Ring the bell and return immediately; a no-op until loadBell() has run. The WAV is 17684
