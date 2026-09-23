@@ -16,14 +16,14 @@
 //   answers the tool_use, matched on tool_use_id, and that result's content is a
 //   one-element array of `{type: "text"}` holding the JSON
 
-const HOME = Deno.env.get("HOME") ?? "";
-const CLAUDE = `${HOME}/.claude`;
-const UTF8 = new TextDecoder();
-const byCodePoint = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+import {byCodePoint, HOME, UTF8} from "./sh.js";
+import {slug} from "./claudes.js";
 
-// The same slug claudes.js builds: the cwd with every non-alphanumeric as `-`.
+const CLAUDE = `${HOME}/.claude`;
+
+// `root` and not HOME, so the tests can point it at a fixture
 function projectDir(root, cwd) {
-  return `${root}/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}`;
+  return `${root}/projects/${slug(cwd)}`;
 }
 
 // sessionId -> name and socket path -> name. `sessions/<pid>.json` exists only while the

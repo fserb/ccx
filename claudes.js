@@ -50,8 +50,12 @@ export function fmtAge(seconds) {
 const SESSIONS = `${HOME}/.claude/sessions`;
 
 // Where claude keeps the session logs for a cwd: the path, non-alphanumerics to -.
+export function slug(cwd) {
+  return cwd.replace(/[^A-Za-z0-9]/g, "-");
+}
+
 function projectDir(cwd) {
-  return `${HOME}/.claude/projects/${cwd.replace(/[^A-Za-z0-9]/g, "-")}`;
+  return `${HOME}/.claude/projects/${slug(cwd)}`;
 }
 
 // When claude last wrote for this cwd, by its session log's mtime. tmux's
@@ -112,14 +116,21 @@ function recordState(rec) {
 // Whether this session ever got an answer, which is what free is not. /clear starts a
 // *new* sessionId whose log is ~2.6KB of bookkeeping with no assistant entry, reading the
 // same as one never asked anything. Past BIG_LOG it is a real conversation, unread.
+// Cached once true, since a log is only appended to, or every poll re-reads up to BIG_LOG
+// of each waiting session.
+const REPLIED = new Set();
+
 function hasReply(cwd, sessionId) {
   const path = `${projectDir(cwd)}/${sessionId}.jsonl`;
+  if (REPLIED.has(path)) return true;
   try {
-    if (Deno.statSync(path).size > BIG_LOG) return true;
-    return Deno.readTextFileSync(path).includes('"type":"assistant"');
+    if (Deno.statSync(path).size <= BIG_LOG &&
+      !Deno.readTextFileSync(path).includes('"type":"assistant"')) return false;
   } catch {
     return false;
   }
+  REPLIED.add(path);
+  return true;
 }
 
 const TITLE_TAIL = 256 * 1024;     // titles sit at most 34KB from the end, over 108 logs
@@ -213,7 +224,9 @@ export class StateClock {
   }
 }
 
-const IS_CLAUDE = /(^|\/)claude(\s|$)|\.claude\/local\/.*cli\.js/;
+// argv0 is claude, or argv1 is the local install's cli.js. Anywhere in the line was too
+// loose: `less ~/notes/claude` matched and drew a row.
+export const IS_CLAUDE = /^(\S*\/)?claude(\s|$)|^\S+\s+\S*\.claude\/local\/\S*cli\.js(\s|$)/;
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(.*)$/;
 
 export async function processes() {

@@ -620,10 +620,14 @@ export async function runSystray(argv = Deno.args) {
 
   const model = new Model(redraw, () => close(), () => Deno.exit(0));
 
+  // Any Host but our own is refused: a web page that rebinds a name of its own onto
+  // 127.0.0.1 reaches this port with its own Host, and would read every path and title.
   const server = Deno.serve(
     {port: 0, hostname: "127.0.0.1", onListen: () => {}},
-    () => new Response(pageWith(model.view()),
-      {headers: {"content-type": "text/html; charset=utf-8"}}),
+    (req) => req.headers.get("host") !== `127.0.0.1:${server.addr.port}`
+      ? new Response("", {status: 403})
+      : new Response(pageWith(model.view()),
+        {headers: {"content-type": "text/html; charset=utf-8"}}),
   );
 
   const tray = new desktop.Tray();
@@ -679,7 +683,8 @@ export async function runSystray(argv = Deno.args) {
    * frameless window KILLS THE APP. The call returns, the line after it runs, and the
    * process is gone with status 0 before the next timer fires, with no exception, no crash
    * report, no `unload`, and a wrapped `Deno.exit` never sees it. It is specific to the
-   * borderless second window; `hide()` on the adopted startup window above is fine.
+   * borderless second window; `hide()` on the adopted startup window above does not end the
+   * process, it only fails to stay hidden, which is why that one is closed instead.
    * `orderOut:` sent through objc does the same, so it is the runtime seeing its last window
    * go, not anything in `hide()`. So
    * `isVisible()` is true for the whole life of the process and cannot answer whether the

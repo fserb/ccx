@@ -2,7 +2,7 @@
 // tmux, no ~/.claude. The library is imported, the renderer is driven as a subprocess, and
 // the icon and the bell are pure.
 
-import {fmtAge, Instance, paneState, StateClock, summaryOf} from "./claudes.js";
+import {fmtAge, Instance, IS_CLAUDE, paneState, StateClock, summaryOf} from "./claudes.js";
 import {fuzzy, NUMBERS, PALETTE, rank, SORTS, STATE} from "./view.js";
 import {loadBell, soundBytes} from "./bell.js";
 import {iconDots, iconPng} from "./icon.js";
@@ -732,6 +732,13 @@ Deno.test("bell: loadBell is idempotent and the bytes are stable", async () => {
 // a rename is not caught anywhere else
 
 const SPINNER_LINE = "✽ Working… (16m 29s · ↓ 54.6k tokens)";
+
+Deno.test("IS_CLAUDE: argv0 or the local cli.js, not a path anywhere in the line", () => {
+  for (const cmd of ["claude", "claude --resume", "/opt/homebrew/bin/claude",
+    "node /Users/x/.claude/local/node_modules/.bin/cli.js"]) ok(IS_CLAUDE.test(cmd), cmd);
+  for (const cmd of ["less ~/notes/claude", "vim /tmp/claude", "claudette",
+    "tail -f /Users/x/.claude/local/cli.js.log"]) ok(!IS_CLAUDE.test(cmd), cmd);
+});
 
 Deno.test("paneState: an empty capture is not a state", () => {
   eq(paneState(""), "", "nothing was read, so the caller keeps the previous state");

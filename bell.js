@@ -10,20 +10,22 @@ const PLAYERS = MAC ? [] : [
   ["paplay"],
   ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-"],
 ];
-let PLAYER = null;             // resolved on the first ring, then reused
+let PLAYER = [];               // the first of PLAYERS that is installed, by loadBell()
 let BELL = null;               // BOTTLE unpacked, by loadBell()
 let RINGER = null;             // plays the system sound, set up on the first ring; macOS only
 
-function bellCmd() {
-  if (PLAYER === null) {
-    PLAYER = PLAYERS.find((p) => sh("sh", "-c", `command -v ${p[0]}`).trim()) ?? [];
+// sh() is async, so this runs once from loadBell() and not from play(), which a poll
+// calls without awaiting. It was a sync call on a Promise until that broke Linux.
+async function findPlayer() {
+  for (const p of PLAYERS) {
+    if ((await sh("sh", "-c", `command -v ${p[0]}`)).trim()) return p;
   }
-  return PLAYER;
+  return [];
 }
 
 // What will make the sound, for doctor.
 export function ringer() {
-  return MAC ? "AudioServicesPlaySystemSound" : bellCmd().join(" ") || "(no player)";
+  return MAC ? "AudioServicesPlaySystemSound" : PLAYER.join(" ") || "(no player)";
 }
 
 // BOTTLE unpacked into the bytes of a WAV file. Async because Deno has no lzma and its
@@ -31,6 +33,7 @@ export function ringer() {
 // 3128). That is why it runs once at startup: play() comes from a poll that cannot await.
 export async function loadBell() {
   if (BELL) return;
+  PLAYER = await findPlayer();
   const packed = Uint8Array.from(atob(BOTTLE.replace(/\s/g, "")), (c) => c.charCodeAt(0));
   const plain = new Uint8Array(await new Response(
     new Blob([packed]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
@@ -123,7 +126,7 @@ export function play() {
     }
     return;
   }
-  const cmd = bellCmd();
+  const cmd = PLAYER;
   if (!cmd.length) return;
   try {
     const child = new Deno.Command(cmd[0], {args: cmd.slice(1), stdin: "piped",

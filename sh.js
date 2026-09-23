@@ -13,12 +13,19 @@ export const BYTES = new TextEncoder();
 // as exit 143 and so needs no branch of its own (measured: 307ms for a 300ms signal).
 const TIMEOUT = 4000;
 export async function sh(...args) {
+  const r = await run(...args);
+  return r.code === 0 ? r.out : "";
+}
+
+// sh() with the exit code and stderr, for a caller that has to say why it failed. -1 is a
+// command that could not start.
+export async function run(...args) {
   try {
     const r = await new Deno.Command(args[0], {args: args.slice(1), stdin: "null",
       signal: AbortSignal.timeout(TIMEOUT)}).output();
-    return r.code === 0 ? UTF8.decode(r.stdout) : "";
-  } catch {
-    return "";
+    return {code: r.code, out: UTF8.decode(r.stdout), err: UTF8.decode(r.stderr)};
+  } catch (e) {
+    return {code: -1, out: "", err: e.message};
   }
 }
 

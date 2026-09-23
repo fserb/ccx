@@ -1,6 +1,6 @@
 // Finding an instance's window and putting it in front of you.
 
-import {BYTES, MAC, ON_EXIT, sh, shSync} from "./sh.js";
+import {BYTES, MAC, ON_EXIT, run, sh, shSync} from "./sh.js";
 import {kittyOwner, processes} from "./claudes.js";
 
 // `kitten @` writes a bare `ESC P @kitty-cmd {...} ESC \`, and tmux forwards only
@@ -76,9 +76,12 @@ export async function jump(inst) {
   const client = inst.clientTty
     ? ["switch-client", "-c", inst.clientTty, "-t", inst.session, ";"]
     : Deno.env.get("TMUX") ? ["switch-client", "-t", inst.session, ";"] : [];
-  await sh("tmux", ...client,
+  // tmux stops at the first command that fails, so a session gone since the last poll
+  // moves nothing; say so, or the systray closes its panel as if the jump worked
+  const r = await run("tmux", ...client,
     "select-window", "-t", `${inst.session}:${inst.window}`, ";",
     "select-pane", "-t", inst.pane);
+  if (r.code !== 0) return `tmux: ${r.err.trim() || `exit ${r.code}`}`;
   if (inst.match) {
     // the client's own tty, so this works with no controlling terminal of our own
     sendKitty("focus-window", {match: inst.match}, inst.clientTty || null);
