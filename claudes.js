@@ -227,6 +227,7 @@ export class StateClock {
 // argv0 is claude, or argv1 is the local install's cli.js. Anywhere in the line was too
 // loose: `less ~/notes/claude` matched and drew a row.
 export const IS_CLAUDE = /^(\S*\/)?claude(\s|$)|^\S+\s+\S*\.claude\/local\/\S*cli\.js(\s|$)/;
+const DAEMON = /^\S+\s+(daemon|bg-pty-host|bg-spare)(\s|$)/;
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(.*)$/;
 
 export async function processes() {
@@ -329,11 +330,22 @@ export async function discover() {
   const paneByPid = new Map(panes.map((p) => [Number(p.pane_pid), p]));
   const clientBySession = new Map(clients.map((c) => [c.client_session, c]));
 
+  // A session that parks its conversation in a background job keeps its pane and names
+  // the job in `parkedJobId`; the job's record (`kind: "bg"`, same `jobId`) is the one
+  // that stays current. Both processes walk up to that pane, so they are one row.
+  const recs = Object.values(records);
+  const jobs = new Map(recs.filter((r) => r.kind === "bg" && r.jobId).map((r) => [r.jobId, r]));
+  const parked = new Set(recs.map((r) => r.parkedJobId).filter((j) => jobs.has(j)));
+
   const found = [];
   const scrape = [];              // [instance, pane_id] for the ones with no record
   for (const [pid, [, cmd]] of procs) {
     if (!IS_CLAUDE.test(cmd)) continue;
-    const rec = records[pid] ?? {};
+    let rec = records[pid] ?? {};
+    // the daemon, its pty hosts and unclaimed spares; a claimed spare has a record
+    if (!records[pid] && DAEMON.test(cmd)) continue;
+    if (rec.kind === "bg" && parked.has(rec.jobId)) continue;
+    rec = jobs.get(rec.parkedJobId) ?? rec;
     // `claude -p` walks up to whatever pane launched it, so it is a phantom second row.
     // `kind` does NOT separate them: on 2.1.273 both say `interactive`, and `entrypoint`
     // is `cli` for a TUI against `sdk-cli` for -p. "not cli" so an entrypoint nobody has
