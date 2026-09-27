@@ -686,6 +686,8 @@ const SAMPLE = [
   // over both crops, so the hard cut at 26 and 50 shows in a frame
   ["busy", 60, "~/prj/a-very-long-directory-name-that-does-not-fit",
     "a summary that is definitely longer than fifty display cells in total", "long-04"],
+  // idle on another session, not on you
+  ["hold", 900, "~/web/arcade", "PS2 blend modes, holding builds for a bench", "arcade-13"],
 ];
 
 function sample() {

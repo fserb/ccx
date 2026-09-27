@@ -12,6 +12,10 @@ const WAIT_FILL = 0.80;     // except a `wait` dot, which is bigger so it is the
 const DOTS = {wait: [0xff, 0xd5, 0x00], busy: [0xc8, 0xc8, 0xc8]};
 const FREE = [0x8c, 0x8c, 0x8c];
 
+// hold is a busy dot with a hole through it: in progress, but somewhere else. The hole is a
+// fraction of the dot, so the stroke stays thicker than the thin no-instances ring.
+const HOLD_HOLE = 0.45;
+
 const SS = 8;               // samples per pixel edge, so 64 levels of coverage on a rim
 const RING = 1.2;           // pt, the stroke for the no-instances ring
 
@@ -131,7 +135,8 @@ export function iconPng(states, scale = 2, offline = false) {
   const spots = iconDots(states, px);
   states.forEach((state, n) => {
     const {cx, cy, r} = spots[n];
-    stamp(rgba, px, cx, cy, r, 0, DOTS[state] ?? FREE);
+    if (state === "hold") stamp(rgba, px, cx, cy, r, r * HOLD_HOLE, DOTS.busy);
+    else stamp(rgba, px, cx, cy, r, 0, DOTS[state] ?? FREE);
   });
   if (!states.length) {     // nothing running still needs something to click on
     const {cx, cy, r} = spots[0];

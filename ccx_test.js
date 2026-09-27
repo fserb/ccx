@@ -2,7 +2,8 @@
 // tmux, no ~/.claude. The library is imported, the renderer is driven as a subprocess, and
 // the icon and the bell are pure.
 
-import {fmtAge, Instance, IS_CLAUDE, paneState, StateClock, summaryOf} from "./claudes.js";
+import {fmtAge, Instance, IS_CLAUDE, openSubscriptions, paneState, StateClock, summaryOf,
+  waitsOn} from "./claudes.js";
 import {fuzzy, NUMBERS, PALETTE, rank, SORTS, STATE} from "./view.js";
 import {loadBell, soundBytes} from "./bell.js";
 import {iconDots, iconPng} from "./icon.js";
@@ -86,9 +87,11 @@ Deno.test("fuzzy: a prefix costs nothing", () => {
 
 // rank
 
-Deno.test("rank: state puts wait before busy before free", () => {
-  const rows = [row("free", 0, "~/a"), row("busy", 0, "~/b"), row("wait", 0, "~/c")];
-  eq(rank(rows, "", "state").map((i) => i.state), ["wait", "busy", "free"], "state order");
+Deno.test("rank: state puts wait before busy before hold before free", () => {
+  const rows = [row("free", 0, "~/a"), row("hold", 0, "~/d"), row("busy", 0, "~/b"),
+    row("wait", 0, "~/c")];
+  eq(rank(rows, "", "state").map((i) => i.state), ["wait", "busy", "hold", "free"],
+    "state order");
 });
 
 Deno.test("rank: within a state the one stuck there longest goes on top", () => {
@@ -189,6 +192,7 @@ Deno.test("colors: the documented luminances are what the hexes are", () => {
   near(luminance(STATE.wait.color), 0.69, 0.005, "wait gold #ffd500");
   near(luminance(PALETTE.text), 0.68, 0.005, "the wait row's summary #d6d6dc");
   near(luminance(STATE.busy.color), 0.39, 0.005, "busy #93aeaa");
+  near(luminance(STATE.hold.color), 0.23, 0.005, "hold #8a7f9c");
   near(luminance(PALETTE.idle), 0.23, 0.005, "every other summary #82828a");
   near(luminance(STATE.free.color), 0.12, 0.005, "free #626262");
   near(luminance(PALETTE.dim), 0.12, 0.005, "the number and age columns #626262");
@@ -251,7 +255,7 @@ const at = (line, n, len = 1) => cellsOf(line).slice(n, n + len).join("");
 const NUM = 2, STATE_COL = 5, FOR = 13, PATH = 20, SUMMARY = 48;
 const PATH_W = 26, SUMMARY_W = 50;
 
-// SAMPLE in `ccx` after rank(): waits oldest-first, then busys, then free. Mirrored here
+// SAMPLE in `ccx` after rank(): waits oldest-first, then busys, then hold, then free. Mirrored here
 // on purpose, so changing the fixture fails loudly instead of weakening the test
 const ROWS = [
   ["● wait", "5m", "~/prj/kanji", "日本語のタイトル in a session title"],
@@ -261,6 +265,7 @@ const ROWS = [
   ["◐ busy", "3m", "~/prj/wrangler", "wrangler config for the edge worker"],
   ["◐ busy", "1m", "~/prj/a-very-long-director",
     "a summary that is definitely longer than fifty dis"],   // both cropped, hard
+  ["○ hold", "15m", "~/web/arcade", "PS2 blend modes, holding builds for a bench"],
   ["◌ free", "2h", "~/web/blob2", ""],
 ];
 const HEAD = 3;                 // bar, rule, header, then the rows
@@ -343,14 +348,14 @@ Deno.test("snapshot: the empty state is a note across the table, not in the stat
 Deno.test("snapshot: a filter that matches nothing says so", async () => {
   const frame = await snapshot("100x14", "plain", "/zz");
   eq(at(frame[HEAD], STATE_COL, 27), "nothing matches that filter", "the note");
-  ok(frame[0].includes("0 of 7"), `the bar counts the survivors: "${frame[0].trim()}"`);
+  ok(frame[0].includes("0 of 8"), `the bar counts the survivors: "${frame[0].trim()}"`);
 });
 
 Deno.test("snapshot: more rows than fit gets a count, not a scrollbar", async () => {
   const frame = await snapshot("100x8", "plain");
   eq(frame.length, 8, "the frame is exactly as tall as the screen");
   // 8 lines: bar, rule, header, 4 rows, and the last line says what is hidden
-  eq(at(frame[7], STATE_COL, 6), "3 more", "3 of the 7 rows are not drawn");
+  eq(at(frame[7], STATE_COL, 6), "4 more", "4 of the 8 rows are not drawn");
   eq(at(frame[HEAD], NUM), "1", "the first row is still drawn");
 });
 
@@ -537,6 +542,15 @@ Deno.test("iconPng: a 36px 2x image, and the dots are the sizes and colors claim
     ok(wait.ink > free.ink * 1.5, "gold is bigger as well as brighter");
   });
 
+Deno.test("iconPng: hold is the busy dot with a hole through it", async () => {
+  const hold = await decodePng(await iconPng(["hold"]));
+  const busy = await decodePng(await iconPng(["busy"]));
+  eq(hold.pixel(18, 18)[3], 0, "the middle is empty");
+  eq(hold.pixel(18, 14), [0xc8, 0xc8, 0xc8, 255], "the ring is the busy grey, opaque");
+  // r 5.58 at 2x with a 0.45 hole: the ring keeps 1 - 0.45^2 of the dot
+  near(hold.ink, busy.ink * (1 - 0.45 ** 2), busy.ink * 0.02, "the ring's area");
+});
+
 Deno.test("iconPng: the dots keep the gold brightest, and only the slash is above it", () => {
   near(luminance("#ffd500"), 0.69, 0.005, "wait, the panel's gold");
   near(luminance("#c8c8c8"), 0.58, 0.005, "busy, brighter here than in the table");
@@ -685,7 +699,7 @@ Deno.test("online: a probe is due every 30s, or every 5s once one has failed", (
 Deno.test("snapshot: offline is written beside the counter, and keeps the key hints",
   async () => {
     const bar = (await snapshot("100x8", "plain", "offline"))[0];
-    ok(bar.includes("offline  ·  3/7  ·  by state"), `the bar reads: ${bar.trim()}`);
+    ok(bar.includes("offline  ·  3/8  ·  by state"), `the bar reads: ${bar.trim()}`);
     ok(bar.includes("^t chat"), "and 100 cells still has room for the keys");
     ok(!(await snapshot("100x8", "plain"))[0].includes("offline"), "nothing when it is up");
   });
@@ -738,6 +752,70 @@ Deno.test("IS_CLAUDE: argv0 or the local cli.js, not a path anywhere in the line
     "node /Users/x/.claude/local/node_modules/.bin/cli.js"]) ok(IS_CLAUDE.test(cmd), cmd);
   for (const cmd of ["less ~/notes/claude", "vim /tmp/claude", "claudette",
     "tail -f /Users/x/.claude/local/cli.js.log"]) ok(!IS_CLAUDE.test(cmd), cmd);
+});
+
+// hold on a peer
+
+// One transcript line each, shaped as 2.1.283 writes them.
+function subscribed(name, ts) {
+  const said = JSON.stringify({success: true, message:
+    `“Ask” → ${name}; queued there\nSubscribed — you will get one notice here when ` +
+    `"${name}" is next idle (or exits), provided that session runs in the same class`});
+  return JSON.stringify({type: "user", timestamp: ts, message: {role: "user", content: [
+    {type: "tool_result", tool_use_id: "toolu_1", content: [{type: "text", text: said}]}]}});
+}
+
+function peerSaid(name, body, ts) {
+  return JSON.stringify({type: "user", timestamp: ts, message: {role: "user", content: body},
+    origin: {kind: "peer", from: "uds:/tmp/cc-socks/1.sock", name, body}});
+}
+
+Deno.test("openSubscriptions: a subscription stays open until that peer says anything", () => {
+  const log = [
+    '{"partial line from the tail cut',
+    subscribed("arcade-eb", "2026-09-27T20:00:00.000Z"),
+    subscribed("arcade-2e", "2026-09-27T20:01:00.000Z"),
+    peerSaid("arcade-2e", "", "2026-09-27T20:05:00.000Z"),
+  ].join("\n");
+  eq(openSubscriptions(log), {"arcade-eb": Date.parse("2026-09-27T20:00:00Z") / 1000},
+    "the empty idle notice from arcade-2e closes its subscription and nothing else");
+  eq(openSubscriptions(peerSaid("arcade-eb", "hi", "2026-09-27T19:00:00Z") + "\n" +
+    subscribed("arcade-eb", "2026-09-27T20:00:00Z")).hasOwnProperty("arcade-eb"), true,
+    "a message from before the subscription does not close it");
+  eq(openSubscriptions(subscribed("uds:/tmp/cc-socks/1.sock", "2026-09-27T20:00:00Z") + "\n" +
+    peerSaid("arcade-eb", "", "2026-09-27T20:05:00Z")), {},
+    "subscribed by socket, answered under a name: origin.from is the socket");
+  const queued = JSON.stringify({type: "attachment", timestamp: "2026-09-27T20:05:00Z",
+    attachment: {type: "queued_command", prompt: '<cross-session-message ' +
+      'from="uds:/tmp/cc-socks/1.sock" from-name="arcade-eb" from-mode="prompting">\nok\n' +
+      '</cross-session-message>'}});
+  eq(openSubscriptions(subscribed("arcade-eb", "2026-09-27T20:00:00Z") + "\n" + queued), {},
+    "a reply that arrived mid-turn, logged as a queued_command attachment");
+  for (const text of [
+    '[Cross-session idle notice] "arcade-eb", which you asked to be notified about, is idle now',
+    '[Cross-session idle notice] "arcade-eb" is not holding your idle subscription (x), so',
+    '[Cross-session idle notice] No idle signal arrived from "arcade-eb" within 6 hours; the',
+  ]) {
+    const notice = JSON.stringify({type: "user", timestamp: "2026-09-27T20:05:00Z",
+      message: {role: "user", content: text}});
+    eq(openSubscriptions(subscribed("arcade-eb", "2026-09-27T20:00:00Z") + "\n" + notice), {},
+      `the harness's own notice: ${text.slice(29, 60)}`);
+  }
+});
+
+Deno.test("waitsOn: only while the peer has not changed status since we went idle", () => {
+  const subs = {"arcade-eb": 100};
+  const me = {status: "idle", statusUpdatedAt: 200_000};
+  const peer = (status, at) => [{name: "arcade-eb", status, statusUpdatedAt: at}];
+  eq(waitsOn(me, peer("busy", 150_000), subs), "arcade-eb", "busy since before our idle");
+  eq(waitsOn(me, peer("shell", 150_000), subs), "arcade-eb", "its own background shell");
+  eq(waitsOn(me, peer("idle", 150_000), subs), "", "idle means the notice has gone out");
+  eq(waitsOn(me, peer("busy", 250_000), subs), "",
+    "busy again after we went idle: it went idle in between, and the notice was lost");
+  eq(waitsOn(me, [], subs), "", "gone: it exited, which also sends the notice");
+  eq(waitsOn(me, [{name: "x", messagingSocketPath: "/tmp/cc-socks/9.sock", status: "busy",
+    statusUpdatedAt: 1}], {"uds:/tmp/cc-socks/9.sock": 1}), "uds:/tmp/cc-socks/9.sock",
+    "a peer addressed by socket rather than name");
 });
 
 Deno.test("paneState: an empty capture is not a state", () => {
@@ -890,8 +968,8 @@ Deno.test("offset: the table starts at the ranked index, and the digits follow i
     eq(at(frame[HEAD], PATH, 9), "~/prj/ccx", "ranked index 1 is drawn first");
     eq(at(frame[HEAD], NUM), "2", "the digit is the ranked position, not the screen row");
     eq(at(frame[HEAD + 1], NUM), "3", "and it keeps counting");
-    // 7 ranked, 4 drawn, so 3 are not on screen: index 0 above and 5 and 6 below
-    eq(at(frame[7], STATE_COL, 6), "3 more", "the count is what is not drawn, either end");
+    // 8 ranked, 4 drawn, so 4 are not on screen: index 0 above and 5 to 7 below
+    eq(at(frame[7], STATE_COL, 6), "4 more", "the count is what is not drawn, either end");
   });
 
 Deno.test("cursor: the SGR constants above are PALETTE and STATE, not copied hexes", () => {
@@ -1111,9 +1189,9 @@ Deno.test("resolve: the fuzzy match reaches the name as well as the path", async
 });
 
 Deno.test("resolve: all is every instance, and self= leaves us out of it", async () => {
-  eq((await resolved("all")).length, 7, "every row in the fixture");
+  eq((await resolved("all")).length, 8, "every row in the fixture");
   const rest = await resolved("all", "self=1002");
-  eq(rest.length, 6, "one fewer");
+  eq(rest.length, 7, "one fewer");
   ok(!rest.some((l) => l.startsWith("1002 ")), `and it is not us: ${rest.join(" | ")}`);
 });
 

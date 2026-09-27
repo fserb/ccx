@@ -3,7 +3,7 @@
 
 import {byCodePoint} from "./sh.js";
 
-const STATE_ORDER = {wait: 0, busy: 1, free: 2};
+const STATE_ORDER = {wait: 0, busy: 1, hold: 2, free: 3};
 export const SORTS = ["state", "path"];
 
 // Subsequence match, {score, idx} or null; lowest score wins. Greedy forward to prove the
@@ -53,11 +53,14 @@ export function rank(instances, needle = "", sort = "state") {
 // is above the gold by relative luminance, which is what makes a `wait` row findable
 // without reading it: gold .69, the wait summary .68, busy .39, every other summary .23,
 // free and the number and age columns .12. #ffd500 is one shade deeper than xterm 220, the
-// exact color Claude Code paints "⏵⏵ auto mode on" with.
+// exact color Claude Code paints "⏵⏵ auto mode on" with. hold, .23, is idle on something
+// that is not you: a background shell, or another session it asked to hear from. ○ U+25CB
+// is East Asian Ambiguous like ●, so `○ hold` is 6 cells.
 export const STATE = {
   wait: {label: "● wait", color: "#ffd500"},
   ask: {label: "◆ wait", color: "#ffd500"},
   busy: {label: "◐ busy", color: "#93aeaa"},
+  hold: {label: "○ hold", color: "#8a7f9c"},
   free: {label: "◌ free", color: "#626262"},
 };
 

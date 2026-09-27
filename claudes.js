@@ -15,6 +15,7 @@ export class Instance {
     this.summary = "";
     this.state = "";          // "" until StateClock fills it in
     this.asking = "";         // the record's waitingFor: a dialog is up, and which one
+    this.waitsOn = "";        // hold on a peer: the name of the session it waits for
     this.name = "";           // the session's own name, what a peer addresses it by
     this.sock = "";           // the record's messagingSocketPath, where peer.js delivers
     this.statusSince = 0;     // epoch of the record's last status change, 0 without one
@@ -75,10 +76,11 @@ function lastWrite(path) {
   return newest;
 }
 
-// Claude Code's own `status`, in ~/.claude/sessions/<pid>.json, onto our three. "waiting"
-// is a dialog holding the screen, "shell" is idle with a background shell still running;
-// both want you, like "idle".
-const RECORD_STATE = {busy: "busy", waiting: "wait", idle: "wait", shell: "wait"};
+// Claude Code's own `status`, in ~/.claude/sessions/<pid>.json, onto ours. "waiting" is a
+// dialog holding the screen and wants you, like "idle". "shell" is idle with a
+// `local_bash` task still running, a background shell or a Monitor, which is hold: busy
+// already covers a running subagent, teammate or workflow, and a shell is left out of it.
+const RECORD_STATE = {busy: "busy", waiting: "wait", idle: "wait", shell: "hold"};
 const BIG_LOG = 256 * 1024;
 
 // Every live session as Claude Code knows it, keyed by pid. The state as the process has
@@ -154,9 +156,9 @@ function sessionTitle(cwd, sessionId) {
   return title;
 }
 
-// The last title in the tail of a session log, /rename's winning over the AI one.
-function readTitle(path, size) {
-  let text;
+// The last TITLE_TAIL of a session log, or "" if it cannot be read. The first line of it
+// is a fragment.
+function readTail(path, size) {
   try {
     const f = Deno.openSync(path, {read: true});
     try {
@@ -169,13 +171,18 @@ function readTitle(path, size) {
         if (n === null || n === 0) break;
         read += n;
       }
-      text = UTF8.decode(buf.subarray(0, read));
+      return UTF8.decode(buf.subarray(0, read));
     } finally {
       f.close();
     }
   } catch {
     return "";
   }
+}
+
+// The last title in the tail of a session log, /rename's winning over the AI one.
+function readTitle(path, size) {
+  const text = readTail(path, size);
   const found = {};
   for (const line of text.split("\n")) {
     if (!line.includes('"type":"ai-title"') && !line.includes('"type":"custom-title"')) continue;
@@ -189,10 +196,104 @@ function readTitle(path, size) {
   return found["custom-title"] ?? found["ai-title"] ?? "";
 }
 
+// A SendMessage with `notify_when_idle` answers with this, naming the session as it
+// resolved it: a name or a `uds:` socket. Anything that session says afterwards closes it.
+const SUBSCRIBED = /Subscribed — you will get one notice here when "(.+?)" is next idle/;
+const SUBS = new Map();            // session log -> [size when read, subscriptions found]
+// A peer message that arrives mid-turn is logged as a queued_command attachment holding
+// the envelope, not as a record with `origin`.
+const ENVELOPE = /^<cross-session-message ([^>]*)>/;
+// The notice itself, when it is not a peer message: idle now, not held, or expired. All
+// three end the subscription and quote the same label it was made under.
+const NOTICE = /^\[Cross-session idle notice\] (?:No idle signal arrived from )?"(.+?)"/;
+
+// The sessions this one asked to tell it when they next go idle or exit, and has not
+// heard from since: name -> epoch subscribed. Cached against the log's size like titles.
+export function subscriptions(cwd, sessionId) {
+  if (!cwd || !sessionId) return {};
+  const path = `${projectDir(cwd)}/${sessionId}.jsonl`;
+  let size;
+  try {
+    size = Deno.statSync(path).size;
+  } catch {
+    return {};
+  }
+  const [sizeRead, cached] = SUBS.get(path) ?? [-1, {}];
+  if (size === sizeRead) return cached;
+  const subs = openSubscriptions(readTail(path, size));
+  SUBS.set(path, [size, subs]);
+  return subs;
+}
+
+export function openSubscriptions(text) {
+  const subs = {};
+  for (const line of text.split("\n")) {
+    if (!line.includes("is next idle") && !line.includes('"kind":"peer"') &&
+      !line.includes("cross-session-message") && !line.includes("idle notice]")) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (rec.origin?.kind === "peer") {  // a subscription names a peer or its `uds:` socket
+      delete subs[rec.origin.name];
+      delete subs[rec.origin.from];
+      continue;
+    }
+    const said = typeof rec.message?.content === "string"
+      ? rec.message.content : String(rec.attachment?.prompt ?? "");
+    const notice = NOTICE.exec(said);
+    if (notice) {
+      delete subs[notice[1]];
+      continue;
+    }
+    const env = ENVELOPE.exec(rec.attachment?.prompt ?? "");
+    if (rec.attachment?.type === "queued_command" && env) {
+      for (const [, , value] of env[1].matchAll(/(from|from-name)="([^"]*)"/g)) {
+        delete subs[value];
+      }
+      continue;
+    }
+    const content = rec.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part.type !== "tool_result") continue;
+      const texts = Array.isArray(part.content)
+        ? part.content.map((c) => c.text ?? "") : [String(part.content ?? "")];
+      for (const t of texts) {
+        let msg = t;
+        try {                           // SendMessage's result is JSON inside the text
+          msg = JSON.parse(t).message ?? t;
+        } catch { /* plain text */ }
+        const m = SUBSCRIBED.exec(msg);
+        if (m) subs[m[1]] = Date.parse(rec.timestamp ?? "") / 1000 || 0;
+      }
+    }
+  }
+  return subs;
+}
+
+// Statuses a session can hold while a subscriber is still owed its idle notice.
+const NOT_IDLE = new Set(["busy", "shell", "waiting"]);
+
+// The session an idle one is on hold for, or "". It subscribed to that session's next idle
+// and has not heard back, and that session has not changed status since this one went
+// idle. The last is what a lost notice cannot fool: a notice that arrived would have woken
+// this one and moved its own statusUpdatedAt past the other's.
+export function waitsOn(rec, recs, subs = subscriptions(rec.cwd ?? "", rec.sessionId ?? "")) {
+  for (const name of Object.keys(subs)) {
+    const peer = recs.find((r) =>
+      r.name === name || (r.messagingSocketPath && `uds:${r.messagingSocketPath}` === name));
+    if (!peer || !NOT_IDLE.has(peer.status)) continue;
+    if ((peer.statusUpdatedAt ?? Infinity) <= (rec.statusUpdatedAt ?? 0)) return name;
+  }
+  return "";
+}
+
 // When each instance entered its current state, and which ones just changed.
 // statusUpdatedAt is the transition itself, so it beats the poll that noticed it and the
-// log mtime, which only seeds instances with no record. idle and shell are both wait, so a
-// flip between them keeps the earlier time.
+// log mtime, which only seeds instances with no record.
 export class StateClock {
   constructor() {
     this.seen = new Map();
@@ -351,7 +452,9 @@ export async function discover() {
     // is `cli` for a TUI against `sdk-cli` for -p. "not cli" so an entrypoint nobody has
     // seen is left out rather than let in; a record-less instance still passes, to scrape
     if (rec.entrypoint && rec.entrypoint !== "cli") continue;
-    const [state, since] = recordState(rec);
+    let [state, since] = recordState(rec);
+    const holdFor = state === "wait" && rec.status === "idle" ? waitsOn(rec, recs) : "";
+    if (holdFor) state = "hold";
     let pane = null, cur = pid;
     for (let n = 0; n < 12; n++) {                 // walk up to the owning pane
       if (paneByPid.has(cur)) {
@@ -364,7 +467,7 @@ export async function discover() {
     const title = sessionTitle(rec.cwd ?? "", rec.sessionId ?? "");
     if (!pane) {                                   // nothing to focus, but the record knows
       found.push(new Instance({pid, summary: title || cmd, path: rec.cwd ?? "",
-        state, asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
+        state, asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "", waitsOn: holdFor,
         name: rec.name ?? "", sock: rec.messagingSocketPath ?? "", statusSince: since}));
       continue;
     }
@@ -383,6 +486,7 @@ export async function discover() {
       summary: Object.keys(rec).length ? title : summaryOf(pane.pane_title),
       state,                       // "" with no record; the scrape below fills it in
       asking: rec.status === "waiting" ? (rec.waitingFor ?? "") : "",
+      waitsOn: holdFor,
       name: rec.name ?? "",
       sock: rec.messagingSocketPath ?? "",
       statusSince: since,
