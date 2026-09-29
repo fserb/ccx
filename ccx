@@ -9,7 +9,7 @@
 import {discover, fmtAge, sessionRecords, StateClock} from "./claudes.js";
 import {HOME, ON_EXIT, sh} from "./sh.js";
 import {fuzzy, NUMBERS, PALETTE, rank, SORTS, stateOf} from "./view.js";
-import {jump, kittyWindowTitle, raiseTarget, tmuxWindowName} from "./jump.js";
+import {jump, kittyWindowTitle, raiseTarget, tmuxWindowName, typeInto} from "./jump.js";
 import {loadBell, play, ringer, soundBytes} from "./bell.js";
 import {Online} from "./online.js";
 
@@ -894,17 +894,35 @@ function resolveTargets(instances, spec, self = 0) {
 const sendLine = (verb, who, where, what) =>
   `${verb.padEnd(6)} ${who.padEnd(12)} ${where.padEnd(30)} ${what}`;
 
-// ccx send <target>[,<target>...] <message...>
-async function cmdSend(...args) {
-  const [spec, ...words] = args;
-  const text = words.join(" ");
+// Validate, then resolve. In that order: a target is resolved against live state, so text
+// that is not there has to be caught first or `ccx send ccx-ef` goes looking for ccx-ef.
+// Exits on usage; returns what `spec` named and what it did not
+async function targets(cmd, spec, text) {
   if (!spec || !text.trim()) usage();
   const {found, missed} = resolveTargets(
     new StateClock().update(await discover()), spec, selfPid());
   if (!found.length) {
-    for (const t of missed) console.error(`send: no instance matches ${JSON.stringify(t)}`);
+    for (const t of missed) console.error(`${cmd}: no instance matches ${JSON.stringify(t)}`);
     usage();
   }
+  return {found, missed};
+}
+
+// One line per target in the order written, and exit 1 if any of them failed. The errs are
+// awaited together: one target can fail while the others land, and a listing that arrives
+// in completion order is unreadable
+function report(verb, found, missed, errs) {
+  for (const t of missed) console.log(sendLine("failed", t, "-", "no instance matches"));
+  found.forEach((i, n) => console.log(errs[n]
+    ? sendLine("failed", i.name || String(i.pid), i.shortPath, errs[n])
+    : sendLine(verb, i.name || String(i.pid), i.shortPath, i.summary)));
+  if (missed.length || errs.some((e) => e)) Deno.exit(1);
+}
+
+// ccx send <target>[,<target>...] <message...>
+async function cmdSend(spec, ...words) {
+  const text = words.join(" ");
+  const {found, missed} = await targets("send", spec, text);
   let sendPeer;
   try {
     ({sendPeer} = await peerModule());
@@ -912,14 +930,16 @@ async function cmdSend(...args) {
     console.error(`send: ${e.message ?? e}`);
     Deno.exit(1);
   }
-  // in flight together, reported in the order written: one target can fail while the others
-  // land, and a listing that arrives in completion order is unreadable
-  const errs = await Promise.all(found.map((i) => sendPeer(i, text)));
-  for (const t of missed) console.log(sendLine("failed", t, "-", "no instance matches"));
-  found.forEach((i, n) => console.log(errs[n]
-    ? sendLine("failed", i.name || String(i.pid), i.shortPath, errs[n])
-    : sendLine("sent", i.name || String(i.pid), i.shortPath, i.summary)));
-  if (missed.length || errs.some((e) => e)) Deno.exit(1);
+  report("sent", found, missed, await Promise.all(found.map((i) => sendPeer(i, text))));
+}
+
+// ccx user <target>[,<target>...] <text...>
+// Typed into the instance's prompt as its own user and submitted, so `/clear` clears it;
+// `send` puts a message from a peer on its queue, which no slash command survives
+async function cmdUser(spec, ...words) {
+  const text = words.join(" ");
+  const {found, missed} = await targets("user", spec, text);
+  report("typed", found, missed, await Promise.all(found.map((i) => typeInto(i, text))));
 }
 
 // ccx chat [--no-follow]
@@ -957,6 +977,7 @@ const COMMANDS = {
   doctor: [cmdDoctor, 0],
   focus: [cmdFocus, 1],
   send: [cmdSend, -1],               // -1: its own validation, since the message is the rest
+  user: [cmdUser, -1],
   chat: [cmdChat, -1],
   systray: [cmdSystray, -1],         // -1: passes its own flags through to the bundle
   help: [cmdHelp, 0],
@@ -977,12 +998,13 @@ const HELP = [
   ["  doctor", "what resolves, and the kitty match it would use"],
   ["  focus <pid>", "jump to an instance without the UI"],
   ["  send <target> <message...>", "a chat message to one or more instances"],
+  ["  user <target> <text...>", "typed into an instance as its user, /commands included"],
   ["  chat [--no-follow]", "what the agents here have said to each other"],
   ["  systray", "the menu bar app, needs ./task build"],
   ["  help", "this"],
   "",
   ["  <target>", "a pid, a session name, `all`, or part of either"],
-  ["", "`send` takes a comma-separated list of them"],
+  ["", "`send` and `user` take a comma-separated list of them"],
 ];
 
 // colour only into a terminal, so a pipe carries the words and nothing else. paint() ends

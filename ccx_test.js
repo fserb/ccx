@@ -1214,6 +1214,9 @@ const BAD = [
   ["send"],                     // no target and nothing to say
   ["send", "ccx-e8"],           // a target and nothing to say
   ["send", "ccx-e8", "   "],    // whitespace is not a message
+  ["user"],                     // the same three, for the same reason
+  ["user", "ccx-e8"],
+  ["user", "ccx-e8", "   "],
   ["chat", "foo"],              // chat takes --no-follow, or nothing
   ["--resolve"],                // no target
   ["--snapshot", "bogus"],
@@ -1238,7 +1241,8 @@ Deno.test("help: asking for it is stdout and 0, a bad argument list is stderr an
     eq(asked.err, "", "and says nothing on stderr");
     ok(asked.out.startsWith("usage: ccx"), `stdout was ${JSON.stringify(asked.out)}`);
     // one text, two streams: every command the table dispatches is named in it
-    for (const name of ["list", "doctor", "focus", "send", "chat", "systray", "help"]) {
+    for (const name of ["list", "doctor", "focus", "send", "user", "chat", "systray",
+      "help"]) {
       ok(new RegExp(`^  ${name}\\b`, "m").test(asked.out), `${name} is not in the help`);
     }
     eq((await ccx("nonesuch")).err, asked.out, "and a bad command prints the same text");
