@@ -140,14 +140,18 @@ export async function kittyWindowTitle(name) {
 // Type `text` into the instance's prompt as its user and press Enter, so a `/command` runs
 // the way a typed one does. Returns an error message, or null when it worked.
 //
-// Keystrokes, not a paste. Claude Code reads a large burst of keys as a paste and turns the
-// Enter after it into a newline: on 2.1.284, 29 characters plus Enter submitted, 751 sat in
-// the input through that Enter and another 4s later. So long text does not submit. A
-// newline in the text is an Enter too. The pane hosted a claude when discover() ran; a
+// A bracketed paste, then Enter. Keys sent with `send-keys -l` are read as an unbracketed
+// paste once there are enough of them, and on 2.1.284 that swallows every Enter after it
+// as a newline: 749 characters sat in the input through the Enter and another 3s later.
+// `paste-buffer -p` wraps the text in the markers, so the paste ends where the text does
+// and the Enter submits, in the same tmux call: 10KB, two lines and `/clear` all measured.
+// A newline in the text stays a newline. The pane hosted a claude when discover() ran; a
 // session that exited since leaves the text in whatever shell took the pane, and runs it.
 export async function typeInto(inst, text) {
   if (!inst.pane) return `pid ${inst.pid} is not inside tmux; nothing to type into`;
-  const r = await run("tmux", "send-keys", "-t", inst.pane, "-l", "--", text, ";",
+  const buf = `ccx-${inst.pid}`;
+  const r = await run("tmux", "set-buffer", "-b", buf, "--", text, ";",
+    "paste-buffer", "-p", "-d", "-b", buf, "-t", inst.pane, ";",
     "send-keys", "-t", inst.pane, "Enter");
   return r.code === 0 ? null : `tmux: ${r.err.trim() || `exit ${r.code}`}`;
 }
