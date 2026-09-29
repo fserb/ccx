@@ -17,11 +17,16 @@ export async function sh(...args) {
   return r.code === 0 ? r.out : "";
 }
 
+// tmux decides UTF-8 from LANG/LC_*, and the launchd plist sets neither, so under the
+// systray it printed every tab in a -F format as `_` and no pane was ever found. -u forces
+// it; it also keeps the glyphs capture-pane and pane_title are read for.
+const argv = (args) => args[0] === "tmux" ? ["-u", ...args.slice(1)] : args.slice(1);
+
 // sh() with the exit code and stderr, for a caller that has to say why it failed. -1 is a
 // command that could not start.
 export async function run(...args) {
   try {
-    const r = await new Deno.Command(args[0], {args: args.slice(1), stdin: "null",
+    const r = await new Deno.Command(args[0], {args: argv(args), stdin: "null",
       signal: AbortSignal.timeout(TIMEOUT)}).output();
     return {code: r.code, out: UTF8.decode(r.stdout), err: UTF8.decode(r.stderr)};
   } catch (e) {
@@ -34,7 +39,7 @@ export async function run(...args) {
 // in the poll loop may use this, since outputSync has no timeout.
 export function shSync(...args) {
   try {
-    const r = new Deno.Command(args[0], {args: args.slice(1), stdin: "null"}).outputSync();
+    const r = new Deno.Command(args[0], {args: argv(args), stdin: "null"}).outputSync();
     return r.code === 0 ? UTF8.decode(r.stdout) : "";
   } catch {
     return "";
